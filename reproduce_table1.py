@@ -59,6 +59,14 @@ for _p in (os.path.expanduser("~/.mujoco/mujoco210/bin"), "/usr/lib/nvidia"):
         _ld = (_ld + ":" + _p) if _ld else _p
 os.environ["LD_LIBRARY_PATH"] = _ld
 
+# mujoco-py does int(CUDA_VISIBLE_DEVICES) to pick its render device; a MIG UUID
+# (non-integer) crashes it. If it's set to something non-integer, unset it so
+# rendering works (torch still sees the MIG device via the container).
+_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+if _cvd and not all(p.strip().isdigit() for p in _cvd.split(",") if p.strip()):
+    print(f"[driver] unsetting non-integer CUDA_VISIBLE_DEVICES={_cvd!r} (breaks mujoco-py)", flush=True)
+    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
 import summarize_run  # reuse the run-scoped summarizer (must sit next to this file)
 
 SEEDS = [100, 200, 300]
