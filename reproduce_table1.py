@@ -40,6 +40,14 @@ os.environ.setdefault("D4RL_SUPPRESS_IMPORT_ERROR", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
 os.environ.setdefault("PLAN_SERIAL_ENV", "1")
 
+# mujoco-py needs MuJoCo 210 + nvidia libs on LD_LIBRARY_PATH at import time.
+# Set it here so the plan.py subprocess (which inherits os.environ) can import gym/env.
+_ld = os.environ.get("LD_LIBRARY_PATH", "")
+for _p in (os.path.expanduser("~/.mujoco/mujoco210/bin"), "/usr/lib/nvidia"):
+    if _p not in _ld.split(":"):
+        _ld = (_ld + ":" + _p) if _ld else _p
+os.environ["LD_LIBRARY_PATH"] = _ld
+
 import summarize_run  # reuse the run-scoped summarizer (must sit next to this file)
 
 SEEDS = [100, 200, 300]
