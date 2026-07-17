@@ -1,0 +1,52 @@
+defaults:
+  - _self_
+  # Single-GPU B200 pod (no SLURM): run locally. Switch back to submitit_slurm on a cluster.
+  - override hydra/launcher: submitit_local
+
+hydra:
+  run:
+    dir: plan_outputs_cem/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}_init${planner.sub_planner.sample_type}
+  sweep:
+    dir: plan_outputs_cem/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}_init${planner.sub_planner.sample_type}
+    subdir: ${hydra.job.num}
+  launcher:
+    submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+    nodes: 1
+    tasks_per_node: 1
+    gpus_per_node: 1
+    cpus_per_task: 16
+    mem_gb: 64
+    timeout_min: 720
+
+ckpt_base_path: ./checkpoints # model to load for planning
+model_name: null
+model_epoch: latest
+seed: 100
+n_evals: 50
+goal_source: 'dset'
+goal_H: 25 
+n_plot_samples: 10
+decode_for_viz: true  # if false, skip world-model decoding/rollout visualization during eval
+num_start_frames: 1
+
+debug_dset_init: False
+
+objective:
+  _target_: planning.objectives.create_objective_fn
+  alpha: 0
+  base: 2 
+  mode: last
+
+planner:
+  _target_: planning.mpc.MPCPlanner
+  max_iter: 1
+  n_taken_actions: 25
+  sub_planner:
+    target: planning.cem.CEMPlanner
+    horizon: 25
+    topk: 30
+    num_samples: 200
+    var_scale: 1
+    opt_steps: 10
+    eval_every: 1
+  name: mpc_cem

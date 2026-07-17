@@ -1,0 +1,23 @@
+__pycache__
+*.pyc
+figures
+*outputs*
+data
+wandb
+checkpoints
+*.slurm
+*.sh
+# keep the B200 helper scripts despite the *.sh ignore above
+!setup_b200.sh
+!run_train.sh
+!run_experiments.sh
+!setup_planning.sh
+!evaluate.sh
+!all_results.sh
+!eval_pusht_3seeds.sh
+# local-only memory/context file (do not commit)
+AGENT_MEMORY.md
+_paper.txt
+*.log
+.ipynb_checkpoints/
+.train_pid

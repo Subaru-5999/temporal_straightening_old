@@ -1,0 +1,22 @@
+# Planning-tier dependencies (needed only to run plan.py, NOT for training).
+# Install these AFTER training finishes (or in a separate venv) via setup_planning.sh.
+# They pull in the simulators the planner rolls out in.
+#
+# PointMaze (UMaze / Medium): needs MuJoCo 210 + mujoco-py + d4rl (see below).
+# Wall: pure torch/numpy + gym (no MuJoCo).
+# PushT: pymunk / pygame / shapely / opencv / scikit-image.
+
+gym==0.23.1
+imageio-ffmpeg     # ffmpeg backend so the planner can save .mp4 rollout videos
+cython<3            # mujoco-py 2.1.x must compile against Cython<3
+mujoco-py==2.1.2.14 # PointMaze; requires MuJoCo 210 + build tools (see setup_planning.sh)
+
+# PushT env extras (only needed for env=pusht):
+pygame==2.5.2
+pymunk==6.8.0
+shapely==2.0.3
+opencv-python==4.6.0.66
+scikit-image==0.19.3
+
+# NOTE: d4rl (provides the PointMaze MazeEnv) is NOT reliably on PyPI.
+# setup_planning.sh installs it from source. Do not add it here.

@@ -1,0 +1,24 @@
+# Training-tier dependencies for point_maze on the B200 venv.
+#
+# torch / torchvision are installed SEPARATELY from the cu128 index (Blackwell),
+# NOT from here -- see setup_b200.sh or:
+#   pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.7.0 torchvision==0.22.0
+#
+# The NGC container already provides numpy, pillow, psutil, tqdm, protobuf, scipy, etc.
+# (the venv is created with --system-site-packages), so only the libs the training
+# code actually imports and that are MISSING from the container are listed here.
+#
+# Derived from the real imports in train.py, utils.py, models/**, datasets/**, metrics/**:
+#   hydra + omegaconf + submitit (config/launcher), accelerate (device/ddp),
+#   einops (tensor ops), decord (point_maze frame decoding), wandb (logging).
+
+hydra-core==1.2.0
+hydra-submitit-launcher==1.2.0
+omegaconf==2.3.0
+submitit==1.5.1
+accelerate==0.26.1
+einops==0.4.1
+decord==0.6.0
+# Modern wandb: robust import + offline logging (WANDB_MODE=offline). Repro note:
+# the paper env pinned 0.13.1, but that is old and can clash with newer protobuf.
+wandb
