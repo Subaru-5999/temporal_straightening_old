@@ -446,6 +446,11 @@ def planning_main(cfg_dict):
     t_after_planning = None
 
     output_dir = cfg_dict["saved_folder"]
+    # Robustness: guarantee the Hydra run dir exists and is our cwd before we write
+    # plan_targets.pkl / logs.json. On some Hydra/chdir + deeply-nested-run.dir setups
+    # the cwd isn't reliably present, causing FileNotFoundError in dump_targets().
+    os.makedirs(output_dir, exist_ok=True)
+    os.chdir(output_dir)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if cfg_dict["wandb_logging"]:
         wandb_run = wandb.init(
