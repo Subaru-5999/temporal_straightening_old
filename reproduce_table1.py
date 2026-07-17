@@ -40,7 +40,10 @@ os.environ.setdefault("WANDB_SILENT", "true")
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 os.environ.setdefault("D4RL_SUPPRESS_IMPORT_ERROR", "1")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
+# On this B200 MIG slice, torch 2.7's default caching allocator NVML-asserts;
+# cudaMallocAsync avoids that NVML path and works. (Do NOT set CUDA_VISIBLE_DEVICES
+# to the MIG UUID -- mujoco-py int()-parses it and crashes; leave it unset.)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 os.environ.setdefault("PLAN_SERIAL_ENV", "1")
 # Cap CPU threads: on many-core nodes torch's default thread pool makes tiny CPU
 # ops (e.g. DINOv2 trunc_normal_ weight init) pathologically slow due to
