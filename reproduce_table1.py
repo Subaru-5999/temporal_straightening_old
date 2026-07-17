@@ -42,6 +42,11 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 os.environ.setdefault("D4RL_SUPPRESS_IMPORT_ERROR", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
 os.environ.setdefault("PLAN_SERIAL_ENV", "1")
+# Cap CPU threads: on many-core nodes torch's default thread pool makes tiny CPU
+# ops (e.g. DINOv2 trunc_normal_ weight init) pathologically slow due to
+# thread-launch/sync overhead. 8 is plenty for dataloading/env; GPU does the math.
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, "8")
 
 # mujoco-py needs MuJoCo 210 + nvidia libs on LD_LIBRARY_PATH at import time.
 # Set it here so the plan.py subprocess (which inherits os.environ) can import gym/env.
