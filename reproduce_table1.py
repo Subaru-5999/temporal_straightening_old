@@ -33,7 +33,10 @@ import subprocess
 
 # ---- env defaults so NO shell exports are needed (export beforehand to override) ----
 os.environ.setdefault("DATASET_DIR", "/workspace/arun/data")
-os.environ.setdefault("WANDB_MODE", "offline")
+# Fully disable wandb for headless eval: no login, no background service, no repo
+# scanning. Results come from logs.json, not wandb. (offline still does work/threads.)
+os.environ.setdefault("WANDB_MODE", "disabled")
+os.environ.setdefault("WANDB_SILENT", "true")
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 os.environ.setdefault("D4RL_SUPPRESS_IMPORT_ERROR", "1")
