@@ -56,7 +56,11 @@ def read_success_rates(root, name):
             except json.JSONDecodeError:
                 continue
             for k, v in d.items():
-                if "success_rate" in k:
+                # ONLY the final planning result per seed. Planners also log a
+                # success_rate every iteration (MPC replans ~20x/seed), so matching
+                # "success_rate in k" would average intermediate climbing values and
+                # inflate n. perform_planning() writes exactly "final_eval/success_rate".
+                if k == "final_eval/success_rate":
                     vals.append(round(100.0 * float(v), 2))
     return vals
 
@@ -89,6 +93,10 @@ def summarize_one(name):
     ol_m, ol_s, ol_n = stats(ol)
     mpc_m, mpc_s, mpc_n = stats(mpc)
     paper = PAPER.get(name, {"label": name, "ol": None, "mpc": None})
+    if ol_n == 0 and mpc_n == 0:
+        # No logs.json for this run yet -- don't clobber any existing results/<name>.json
+        print(f"  (no logs found for {name}; skipping)")
+        return None
     rec = {
         "run": name, "label": paper["label"],
         "open_loop": {"seeds": ol, "mean": ol_m, "std": ol_s, "n": ol_n, "paper": paper["ol"]},
@@ -160,6 +168,11 @@ def main():
     args = ap.parse_args()
     if args.run and not args.all:
         summarize_one(args.run)
+    elif args.all:
+        # Re-scan every known run's logs.json from scratch (recomputes results/<name>.json
+        # with the current parser -- use this to re-derive results without re-running evals).
+        for name in PAPER:
+            summarize_one(name)
     rebuild_master()
 
 

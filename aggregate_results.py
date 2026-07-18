@@ -46,7 +46,9 @@ def read_all_success_rates(logs_path):
                 except json.JSONDecodeError:
                     continue
                 for k, v in d.items():
-                    if "success_rate" in k:
+                    # Only the final result per seed (planners also log per-iteration
+                    # success_rate; matching substring would average intermediates).
+                    if k == "final_eval/success_rate":
                         vals.append(float(v))
     except OSError:
         pass
