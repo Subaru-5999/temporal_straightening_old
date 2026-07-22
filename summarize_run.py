@@ -16,6 +16,7 @@ Usage:
     python summarize_run.py --all            # only rebuild + print the master table from results/*.json
 """
 import os
+import re
 import sys
 import glob
 import json
@@ -23,6 +24,11 @@ import argparse
 import statistics
 
 RESULTS_DIR = "results"
+
+
+def base_cell(name):
+    """Strip a trailing _seed<N> so training-seed variants share the base cell's paper target."""
+    return re.sub(r"_seed\d+$", "", name)
 
 # Paper Table 1 (GD planner) targets for the exact 5 cells we reproduce: (mean, std) %.
 PAPER = {
@@ -92,7 +98,7 @@ def summarize_one(name):
     mpc = read_success_rates("plan_outputs_gd_mpc", name)  # MPC (GD subplanner)
     ol_m, ol_s, ol_n = stats(ol)
     mpc_m, mpc_s, mpc_n = stats(mpc)
-    paper = PAPER.get(name, {"label": name, "ol": None, "mpc": None})
+    paper = PAPER.get(name) or PAPER.get(base_cell(name), {"label": name, "ol": None, "mpc": None})
     if ol_n == 0 and mpc_n == 0:
         # No logs.json for this run yet -- don't clobber any existing results/<name>.json
         print(f"  (no logs found for {name}; skipping)")
@@ -127,6 +133,12 @@ def print_block(rec):
 def rebuild_master():
     recs = []
     for f in sorted(glob.glob(os.path.join(RESULTS_DIR, "*.json"))):
+        # keep the master table to the tracked cells; per-training-seed variants
+        # (<cell>_seedN.json) and the training-seed aggregate (<cell>_trainseed.json)
+        # are reported separately by aggregate_trainseeds.py.
+        b = os.path.basename(f)
+        if b.endswith("_trainseed.json") or re.search(r"_seed\d+\.json$", b):
+            continue
         try:
             recs.append(json.load(open(f)))
         except Exception:

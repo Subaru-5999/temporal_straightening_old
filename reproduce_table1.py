@@ -25,6 +25,7 @@ Detached (survives disconnects; nohup is POSIX, not bash-specific):
     tail -f eval_all.log
 """
 import os
+import re
 import sys
 import glob
 import shutil
@@ -82,6 +83,12 @@ CFG = {
 ORDER = list(CFG)
 
 
+def base_cell(name):
+    """Strip a trailing _seed<N> so training-seed variants map to their base cell's
+    (alpha, mpc_mode) and paper targets. 'pusht_..._lr1e-06_seed2' -> 'pusht_..._lr1e-06'."""
+    return re.sub(r"_seed\d+$", "", name)
+
+
 def clean_scoped(name):
     """Remove ONLY this run's plan_outputs so its logs.json holds exactly its 3 seeds."""
     for root in ("plan_outputs_gd", "plan_outputs_gd_mpc"):
@@ -98,10 +105,11 @@ def run_plan(cfg_name, run_dir, name, extra):
 
 
 def run_eval(name, base):
-    if name not in CFG:
+    cell = base_cell(name)
+    if cell not in CFG:
         print(f"!!! SKIP {name}: unknown run (no alpha/mode mapping)", flush=True)
         return
-    alpha, mpc_mode = CFG[name]
+    alpha, mpc_mode = CFG[cell]
     run_dir = os.path.join(base, name)
     print("\n" + "#" * 60, flush=True)
     print(f"# RUN: {name}\n#   alpha={alpha}  open-loop=last  mpc={mpc_mode}", flush=True)
