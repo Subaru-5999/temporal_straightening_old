@@ -32,6 +32,9 @@ class VWorldModel(nn.Module):
         vcreg_std_coeff=0,
         vcreg_cov_coeff=0,
         vcreg_apply_to="enc",
+        straighten_scales=None,
+        straighten_scale_weights=None,
+        straighten_goal_weight=0.0,
         **kwargs,
     ):
         super().__init__()
@@ -74,6 +77,27 @@ class VWorldModel(nn.Module):
 
         self.straighten = self.curvature_mode is not None and self.straighten_scale > 0
 
+        # ---- Multi-scale (hierarchical) straightening config ----------------------
+        # Backward compatible: scales == [1] reproduces the paper's single-scale
+        # (consecutive-frame) curvature loss exactly. Set e.g. [1, 3, 5, 10] to also
+        # straighten at coarser temporal scales. Curvature at scale s needs >= 2s+1
+        # latent frames in the window (enforced by the dataloader window length).
+        if not straighten_scales:
+            self.straighten_scales = [1]
+        else:
+            self.straighten_scales = [int(s) for s in straighten_scales]
+        if straighten_scale_weights is None:
+            self.straighten_scale_weights = [1.0] * len(self.straighten_scales)
+        else:
+            assert len(straighten_scale_weights) == len(self.straighten_scales), (
+                "straighten_scale_weights must have the same length as straighten_scales"
+            )
+            self.straighten_scale_weights = [float(w) for w in straighten_scale_weights]
+        # weight mu of the optional directional (goal-aligned) term; 0 = disabled
+        self.straighten_goal_weight = float(straighten_goal_weight)
+        # frames the training window must have so every requested scale fits
+        self.straighten_min_frames = 2 * max(self.straighten_scales) + 1
+
         log.info("num_action_repeat: %s", self.num_action_repeat)
         log.info("num_proprio_repeat: %s", self.num_proprio_repeat)
         log.info("proprio encoder: %s", proprio_encoder)
@@ -86,6 +110,13 @@ class VWorldModel(nn.Module):
                 "Straightening enabled: mode=%s, scale=%s",
                 self.curvature_mode,
                 self.straighten_scale,
+            )
+            log.info(
+                "Multi-scale straightening: scales=%s weights=%s goal_weight=%s (needs window>=%s frames)",
+                self.straighten_scales,
+                self.straighten_scale_weights,
+                self.straighten_goal_weight,
+                self.straighten_min_frames,
             )
         else:
             log.info("Straightening disabled")
@@ -274,25 +305,77 @@ class VWorldModel(nn.Module):
             loss = loss[mask]
         return loss.mean()
 
+    def _scale_velocity_curvature(self, z, s):
+        """Scale-s straightening term  L_curv^(s) = 1 - mean_t cos(v_t^(s), v_{t+s}^(s)),
+        where the scale-s velocity is v_t^(s) = z_{t+s} - z_t (paper Eq. 3-4/6 with a
+        step gap of s). Returns None if the window is too short (needs >= 2s+1 frames).
+        For s == 1 this is identical to the paper's consecutive-frame curvature.
+        z: (b, T, ..., d); cosine is taken over the last dim."""
+        T = z.shape[1]
+        if T < 2 * s + 1:
+            return None
+        va = z[:, s:] - z[:, :-s]      # v_t^(s) = z_{t+s} - z_t   (length T - s)
+        v1 = va[:, :-s]                # v_t^(s)
+        v2 = va[:, s:]                 # v_{t+s}^(s)
+        return self._cos_curvature(v1, v2)
+
+    def _scale_goal_alignment(self, z, s, z_goal):
+        """Optional directional term  1 - mean_t cos(v_t^(s), z_goal - z_t): encourage each
+        scale-s velocity to point toward the goal. At training time we have no true goal,
+        so z_goal is the window's last latent (a pseudo-goal). Returns None if too short."""
+        T = z.shape[1]
+        if T < s + 1:
+            return None
+        va = z[:, s:] - z[:, :-s]                 # v_t^(s)              (length T - s)
+        to_goal = z_goal.unsqueeze(1) - z[:, :-s]  # (z_goal - z_t)       (length T - s)
+        cos = F.cosine_similarity(va, to_goal, dim=-1, eps=1e-6)
+        return (1.0 - cos).mean()
+
     def total_curvature(self, features, mode="cos"):
         if features.shape[1] < 3:
             raise ValueError(f"Features must have at least 3 frames for curvature calculation, got {features.shape[1]}")
 
+        # Build the per-frame representation z on which curvature is measured.
         if mode == "aggcos":
             if not hasattr(self.encoder, "agg"):
                 raise ValueError("curvature mode 'aggcos' requires encoder.agg().")
             b, t, p, d = features.shape
             tokens = features.reshape(b * t, p, d)
-            z = self.encoder.agg(tokens).reshape(b, t, -1)
-            v1 = z[:, 1:-1] - z[:, :-2]
-            v2 = z[:, 2:] - z[:, 1:-1]
+            z = self.encoder.agg(tokens).reshape(b, t, -1)   # (b, T, dim) global feature
         elif mode == "cos":
-            v1 = features[:, 1:-1] - features[:, :-2]
-            v2 = features[:, 2:] - features[:, 1:-1]
+            z = features                                     # (b, T, p, d) per-patch
         else:
             raise ValueError(f"Unknown curvature mode '{mode}'. Use 'cos' or 'aggcos'.")
 
-        return self._cos_curvature(v1, v2)
+        # ---- Multi-scale curvature: weighted sum over scales (scales==[1] == paper) ----
+        #   L_multi = sum_s  w_s * L_curv^(s)
+        total = None
+        used = []
+        for s, w in zip(self.straighten_scales, self.straighten_scale_weights):
+            c = self._scale_velocity_curvature(z, s)
+            if c is None:
+                continue  # this scale doesn't fit the current window; skip it
+            used.append(s)
+            total = (w * c) if total is None else (total + w * c)
+        if total is None:
+            raise ValueError(
+                f"No straightening scale fit the window (T={features.shape[1]}, "
+                f"scales={self.straighten_scales}); each scale s needs T >= 2s+1 frames."
+            )
+
+        # ---- Optional directional (goal) term; pseudo-goal = last latent in the window ----
+        if self.straighten_goal_weight > 0:
+            z_goal = z[:, -1]
+            g_total = None
+            for s in self.straighten_scales:
+                g = self._scale_goal_alignment(z, s, z_goal)
+                if g is None:
+                    continue
+                g_total = g if g_total is None else (g_total + g)
+            if g_total is not None:
+                total = total + self.straighten_goal_weight * g_total
+
+        return total
 
     def forward(self, obs, act):
         """
@@ -307,9 +390,14 @@ class VWorldModel(nn.Module):
         decoder_enabled = self.decoder is not None and self.train_decoder
         z = self.encode(obs, act)
         z_src = z[:, : self.num_hist, :, :]  # (b, num_hist, num_patches, dim)
-        z_tgt = z[:, self.num_pred :, :, :]  # (b, num_hist, num_patches, dim)
+        # Cap the prediction target to num_hist frames. When the window T is longer than
+        # num_hist+num_pred (needed for multi-scale straightening) this keeps the
+        # prediction loss unchanged; when T == num_hist+num_pred it is identical to the
+        # original z[:, num_pred:] slice. The full-length z (all T frames) is still used
+        # for the straightening term below.
+        z_tgt = z[:, self.num_pred : self.num_pred + self.num_hist, :, :]  # (b, num_hist, num_patches, dim)
         visual_src = obs['visual'][:, : self.num_hist, ...]  # (b, num_hist, 3, img_size, img_size)
-        visual_tgt = obs['visual'][:, self.num_pred :, ...]  # (b, num_hist, 3, img_size, img_size)
+        visual_tgt = obs['visual'][:, self.num_pred : self.num_pred + self.num_hist, ...]  # (b, num_hist, 3, ...)
 
         if self.predictor is not None:
             z_pred = self.predict(z_src)

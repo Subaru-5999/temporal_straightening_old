@@ -125,11 +125,32 @@ class Trainer:
 
         seed(cfg.training.seed)
         log.info(f"Loading dataset from {self.cfg.env.dataset.data_path} ...")
-        self.datasets, traj_dsets = hydra.utils.call(
-            self.cfg.env.dataset,
+        # Multi-scale straightening needs a longer sliced window: curvature at scale s
+        # requires >= 2s+1 latent frames. By default (single-scale) num_frames stays at
+        # num_hist+num_pred, so the faithful reproduction is unchanged. When scales are
+        # set, we widen the window to (2*max_scale + 1) and pass it to the dataset loader
+        # (pusht/point_maze accept a num_frames override). The prediction loss still uses
+        # only the first num_hist+num_pred frames (see VWorldModel.forward).
+        _dataset_kwargs = dict(
             num_hist=self.cfg.num_hist,
             num_pred=self.cfg.num_pred,
             frameskip=self.cfg.frameskip,
+        )
+        _scales = self.cfg.training.get("straighten_scales", None)
+        if _scales:
+            _needed = 2 * max(int(s) for s in _scales) + 1
+            _base = self.cfg.num_hist + self.cfg.num_pred
+            if _needed > _base:
+                _dataset_kwargs["num_frames"] = _needed
+                log.info(
+                    "Multi-scale straightening: dataset window num_frames=%s "
+                    "(base num_hist+num_pred=%s) so scales=%s fit; needs trajectories "
+                    ">= %s env-steps (num_frames*frameskip).",
+                    _needed, _base, list(_scales), _needed * self.cfg.frameskip,
+                )
+        self.datasets, traj_dsets = hydra.utils.call(
+            self.cfg.env.dataset,
+            **_dataset_kwargs,
         )
 
         self.train_traj_dset = traj_dsets["train"]
@@ -403,6 +424,9 @@ class Trainer:
             vcreg_std_coeff=self.cfg.training.get("vcreg_std_coeff", 0),
             vcreg_cov_coeff=self.cfg.training.get("vcreg_cov_coeff", 0),
             vcreg_apply_to=self.cfg.training.get("vcreg_apply_to", "enc"),
+            straighten_scales=self.cfg.training.get("straighten_scales", None),
+            straighten_scale_weights=self.cfg.training.get("straighten_scale_weights", None),
+            straighten_goal_weight=self.cfg.training.get("straighten_goal_weight", 0.0),
         )
         self._log_trainable_params(self.model, "model")
 

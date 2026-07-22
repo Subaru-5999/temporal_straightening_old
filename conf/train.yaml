@@ -35,6 +35,15 @@ training:
   save_every_x_epoch: 1
   save_every_x_iterations: 1000
   straighten: False  # e.g. cos1e-2 or aggcos1e-2
+  # ---- Multi-scale (hierarchical) straightening: NOVEL extension, single-scale by default ----
+  # straighten_scales=null (or [1]) reproduces the paper exactly. Set e.g. [1,3,5,10] to also
+  # straighten at coarser temporal scales. Requires the encoder to be trainable and
+  # `straighten` enabled (e.g. aggcos1e-1). Curvature at scale s needs >= 2s+1 latent frames,
+  # i.e. trajectories >= (2*max_scale+1)*frameskip env-steps (PushT ok for s<=10; PointMaze
+  # len-100 only supports smaller scales). The overall lambda is still `straighten` (e.g. 0.1).
+  straighten_scales: null
+  straighten_scale_weights: null   # per-scale weights w_s (same length as scales); null = all 1.0
+  straighten_goal_weight: 0.0      # mu>0 adds the directional term (pseudo-goal = window's last frame)
   decoder_start_epoch: 1  # start optimizing decoder at this epoch
   reconstruct_every_x_batch: 1000
   num_reconstruct_samples: 5

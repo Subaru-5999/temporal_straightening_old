@@ -162,6 +162,7 @@ def load_point_maze_slice_train_val(
     frameskip=0,
     use_preprocessed=False,
     use_frame_files=False,
+    num_frames=None,
 ):
     dset = PointMazeDataset(
         n_rollout=n_rollout,
@@ -174,7 +175,7 @@ def load_point_maze_slice_train_val(
     dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
         traj_dataset=dset, 
         train_fraction=split_ratio, 
-        num_frames=num_hist + num_pred, 
+        num_frames=(num_frames if num_frames is not None else num_hist + num_pred), 
         frameskip=frameskip
     )
 

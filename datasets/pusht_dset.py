@@ -144,6 +144,7 @@ def load_pusht_slice_train_val(
     num_pred=0,
     frameskip=0,
     with_velocity=True,
+    num_frames=None,
 ):
     train_dset = PushTDataset(
         n_rollout=n_rollout,
@@ -160,7 +161,9 @@ def load_pusht_slice_train_val(
         with_velocity=with_velocity,
     )
 
-    num_frames = num_hist + num_pred
+    # num_frames defaults to num_hist+num_pred (paper); a longer override is passed in
+    # for multi-scale straightening so coarse scales fit in the window.
+    num_frames = num_frames if num_frames is not None else (num_hist + num_pred)
     train_slices = TrajSlicerDataset(train_dset, num_frames, frameskip)
     val_slices = TrajSlicerDataset(val_dset, num_frames, frameskip)
 
