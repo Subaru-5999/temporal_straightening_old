@@ -278,3 +278,144 @@ Re-running the exact protocol on B200 reproduces the SAME numbers (training is d
 run-to-run on the same slice — proven). The ✗ upward drift is a pure H100→B200 + torch-2.7
 artifact, not fixable in code. ✓ rows land in band (method validated); ✗ rows sit high (hardware).
 Only H100 hardware (or a bf16→fp32/determinism change, which deviates from the paper) would move ✗.
+
+---
+
+## 10. NOVEL EXTENSION — Multi-Scale (Hierarchical) Straightening (ICRA experiment)
+
+This section is the **standalone reference** for the multi-scale straightening extension we
+designed, implemented, committed, and launched. It is a *novel research extension*, cleanly
+separated from and config-gated off of the faithful paper reproduction (§0–§9). The faithful
+path is untouched: with no multi-scale flags the code is **bit-identical** to the original
+(verified curvature value `1.49174845` and study-guide worked example `L^(1)=0.3333`,
+`L^(2)=1.0000`).
+
+### 10.1 The idea (what & why)
+The paper straightens the latent trajectory **only at the finest scale** — consecutive-frame
+velocity cosine (`z_t, z_{t+1}, z_{t+2}`). Multi-scale straightening adds curvature penalties at
+**coarser temporal scales** so latent trajectories are straight at multiple resolutions, which
+targets long-horizon drift and hierarchical abstraction (robotics-relevant: manipulation,
+navigation, model-based RL).
+
+### 10.2 Math (grounded in paper Eqs 3–7 + user's ICRA spec)
+For scale `s`:
+- scale-`s` velocity:  `v_t^(s) = z_{t+s} − z_t`
+- scale-`s` curvature term: `C_t^(s) = cos( v_t^(s), v_{t+s}^(s) )`, then `L^(s) = 1 − mean_t C_t^(s)`
+- multi-scale loss: `L_multi = Σ_s w_s · L^(s)`
+- total objective (extends paper Eq 7): `L_total = L_pred + λ · Σ_s w_s L^(s)`
+  where `λ` = the existing `training.straighten` strength (e.g. `aggcos1e-1` → 0.1).
+- optional directional/goal term (off by default): `L_goal = Σ_s μ_s (1 − cos(v_t^(s), z_g − z_t))`.
+
+**Theory link (paper Theorem 4.4):** coarse-scale velocities regularize higher powers `A^s ≈ I`
+of the transition matrix, tightening the bound on the planning-Hessian condition number
+`κ_eff` for large horizon `K` → more stable GD/MPC at `H ≫ 5`.
+
+### 10.3 Two documented deviations from the spec's literal notation
+1. **Objective re-parameterization.** The spec writes `L_pred + λ_local L^(1) + Σ_s λ_s L^(s)`,
+   which double-counts `s=1`. We implement the clean, equivalent `L_pred + λ · Σ_s w_s L^(s)`
+   (single `λ` = `training.straighten`, per-scale `w_s` = `straighten_scale_weights`). No literal
+   double-count.
+2. **Goal term uses a pseudo-goal** = the window's last latent `z[:, -1]` (there is no true goal
+   at training time). It is **off by default** (`straighten_goal_weight=0.0`).
+
+### 10.4 Implementation (files & exact changes) — committed
+- **`models/visual_world_model.py`**
+  - New constructor args: `straighten_scales`, `straighten_scale_weights`, `straighten_goal_weight`.
+  - Backward compat: `straighten_scales` falsy → `[1]` (== paper single-scale). `scales=[1]` is
+    bit-identical to the original.
+  - `self.straighten_min_frames = 2·max(scales) + 1` (min latent frames a window must hold).
+  - New `_scale_velocity_curvature(z, s)`: builds `v^(s)=z[:,s:]−z[:,:-s]`, cosine of `va[:,:-s]`
+    vs `va[:,s:]`; returns `None` if the window is too short for scale `s`.
+  - New `_scale_goal_alignment(z, s, z_goal)`: the optional directional term.
+  - `total_curvature` rewritten as the **weighted sum over scales** (raises if no scale fits).
+  - `forward`: prediction target **capped** to `z[:, num_pred : num_pred+num_hist]` so a widened
+    window (T can exceed `num_hist+num_pred`) does NOT change the prediction loss.
+- **`train.py`**
+  - Passes the 3 new params to the model (`self.cfg.training.get(...)`).
+  - **Auto-widens the dataset window** to `num_frames = 2·max_scale+1` when scales are set,
+    then passes `num_frames` to the loader. Logs: `Multi-scale straightening: dataset window
+    num_frames=...`.
+- **`conf/train.yaml`**: added `straighten_scales: null`, `straighten_scale_weights: null`,
+  `straighten_goal_weight: 0.0` (documented; defaults reproduce the paper).
+- **`datasets/pusht_dset.py`, `datasets/point_maze_dset.py`**: accept a `num_frames` override.
+
+### 10.5 Git state
+- Code committed as **`66e4b28`** ("Add multi-scale (hierarchical) straightening loss …"),
+  pushed to `main` (`github.com/Subaru-5999/temporal_straightening_old`).
+- Follow-up **`0593d77`** committed this memory file + backward-compatible `_seed` handling in
+  `reproduce_table1.py`/`summarize_run.py`.
+- **Deliberately NOT on the hub** (per user): `STUDY_GUIDE_temporal_straightening.md`, `.kiro/`,
+  `temporal_straightening_original.zip`, `arXiv-2603.12231v2.tar.gz`. They remain untracked locally.
+
+### 10.6 Exact run command (multi-scale PushT ✓, B200 pod) — VERIFIED launched
+Uses a **separate ckpt path** (`checkpoints_multiscale`) so it can never overwrite the faithful ✓.
+```bash
+cd /workspace/arun/temporal_straightening_old && git pull
+unset CUDA_VISIBLE_DEVICES
+export DATASET_DIR=/workspace/arun/data D4RL_SUPPRESS_IMPORT_ERROR=1 WANDB_MODE=disabled WANDB_SILENT=true
+export PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 NUMEXPR_NUM_THREADS=8
+setsid nohup python train.py --config-name train.yaml env=pusht encoder=dino_channel \
+  training.straighten=aggcos1e-1 training.encoder_lr=1e-5 training.epochs=2 env.num_workers=4 \
+  'training.straighten_scales=[1,3,5,10]' 'training.straighten_scale_weights=[1,1,2,4]' \
+  has_decoder=false ckpt_base_path=$PWD/checkpoints_multiscale \
+  > train_pusht_multiscale.log 2>&1 < /dev/null &
+```
+**Verify it engaged** (must print all three):
+```bash
+grep -aE "Multi-scale straightening|Straightening enabled|dataset window num_frames" train_pusht_multiscale.log
+```
+**Evaluate after training:**
+```bash
+export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PLAN_SERIAL_ENV=1
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/.mujoco/mujoco210/bin:/usr/lib/nvidia
+python reproduce_table1.py pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05 \
+  --base $PWD/checkpoints_multiscale/test
+```
+
+### 10.7 Monitoring (progress snapshot)
+```bash
+ps -eo pid,etime,rss,cmd | grep "[t]rain.py"     # alive? etime = wall-clock elapsed
+tr '\r' '\n' < train_pusht_multiscale.log | \
+  grep -aE "Multi-scale straightening|Straightening enabled|Epoch [0-9]+ (Train|Valid)|Training loss|Saved model" | tail -n 15
+```
+
+### 10.8 Understanding the epoch length (IMPORTANT — asked & answered)
+- The tqdm total (e.g. **15798**) is the **number of mini-batches per epoch** =
+  `ceil(num_train_windows / batch_size)` (batch_size=32) → here ~505k training windows.
+  It is **the same every epoch** (slices are computed once at dataset init and reused).
+- **Why multi-scale epochs are shorter than a single-scale run:** the slicer
+  (`datasets/traj_dset.py TrajSlicerDataset`) cuts `max(0, T − num_frames·frameskip + 1)` windows
+  per trajectory of length `T`.
+  - Multi-scale `scales=[1,3,5,10]` → `num_frames=21`, `frameskip=5` → window spans **105 env-steps**
+    → `T−104` windows/traj, and **any trajectory < 105 env-steps yields ZERO windows**.
+  - Faithful single-scale → `num_frames=4` → 20-env-step window → `T−19` windows/traj.
+  - ⇒ multi-scale drops ~85 windows/traj + discards short trajectories → far fewer iterations.
+    This is expected arithmetic, not a bug. `scales=[1,3,5]` (`num_frames=11`, 55-step window)
+    keeps many more windows and yields a longer epoch.
+
+### 10.9 Expectations (honest, for next time)
+- **Exploratory research, not reproduction** — outcome uncertain (help / neutral / regress).
+- **Compare against single-scale ✓ on the SAME B200 = 75.33 OL / 82.00 MPC**, NOT the paper's
+  77.33/85.33 (comparing to the paper would conflate the extension with the H100→B200 bf16 drift
+  documented in §8–§9).
+- The standard eval uses `goal_H=25` → **H≈5** (short horizon). Multi-scale's claimed +10–25% is a
+  **long-horizon (50+ step) claim**, so on the standard eval expect a **small / within-noise**
+  change. A real test needs a long-horizon eval harness (**NOT built yet** — future work).
+- **Memory / OOM**: 21-frame windows ≈ 5× encoder memory of single-scale. If it OOMs at batch 32:
+  fall back to `training.batch_size=8` OR `'training.straighten_scales=[1,3,5]'` (11-frame windows).
+- **Slower** than the ~12 h single-scale run.
+
+### 10.10 Runtime warnings seen (triage)
+- `tail: inotify cannot be used, reverting to polling` — harmless (network FS + `tail -f`). Ignore.
+- `Too many open files` — real FD-limit pressure (DINO backbone + `num_workers`). Kept running, but
+  if it hard-crashes workers (`OSError: [Errno 24]`): `ulimit -n 65535` before relaunch and/or
+  lower `env.num_workers=2`.
+
+### 10.11 Future work / TODO for the ICRA writeup
+- Build a **long-horizon eval** (50+ steps) — the setting where multi-scale should actually help;
+  the standard `goal_H=25`/H=5 eval cannot show the claimed gain.
+- **Per-scale curvature logging** to training logs (spec §6) — not yet added.
+- Ablations: scale sets `{1,3,5}` vs `{1,3,5,10}`, weighting schemes, global vs spatial features,
+  GD vs CEM (show reduced reliance on samplers), Hessian condition-number analysis.
+- Run the same extension on **PointMaze/UMaze** (note len-100 trajectories only support small
+  scales; `max_scale=10` needs ≥105-step trajectories, so UMaze can only use smaller scales).
