@@ -368,7 +368,11 @@ def load_ckpt(snapshot_path, device):
     loaded_keys = []
     result = {}
     for k, v in payload.items():
-        if k in ALL_MODEL_KEYS:
+        # Skip keys stored as None: a has_decoder=false run still writes a
+        # "decoder": None entry (train_decoder defaults True, so the key is saved,
+        # but the module is None). load_model fills in decoder=None afterwards.
+        # Without this guard, None.to(device) raises AttributeError.
+        if k in ALL_MODEL_KEYS and v is not None:
             loaded_keys.append(k)
             result[k] = v.to(device)
     result["epoch"] = payload["epoch"]
