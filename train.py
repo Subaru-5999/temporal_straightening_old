@@ -137,17 +137,30 @@ class Trainer:
             frameskip=self.cfg.frameskip,
         )
         _scales = self.cfg.training.get("straighten_scales", None)
-        if _scales:
-            _needed = 2 * max(int(s) for s in _scales) + 1
-            _base = self.cfg.num_hist + self.cfg.num_pred
-            if _needed > _base:
-                _dataset_kwargs["num_frames"] = _needed
-                log.info(
-                    "Multi-scale straightening: dataset window num_frames=%s "
-                    "(base num_hist+num_pred=%s) so scales=%s fit; needs trajectories "
-                    ">= %s env-steps (num_frames*frameskip).",
-                    _needed, _base, list(_scales), _needed * self.cfg.frameskip,
-                )
+        _straighten_on = bool(self.cfg.training.get("straighten", False))
+        if _scales and _straighten_on:
+            # Only scales with a positive coefficient (lambda>0) are ACTIVE and need a wider
+            # window. lambda=0 disables a scale, so it no longer widens the data window ->
+            # switching a scale off reverts the data pipeline to the remaining active scales
+            # (e.g. lambdas=[0.1, 0] on scales=[1,4] trains on the paper's exact 4-frame window).
+            _lambdas = self.cfg.training.get("straighten_lambdas", None)
+            if _lambdas is not None:
+                _coeffs = list(_lambdas)
+            else:
+                _weights = self.cfg.training.get("straighten_scale_weights", None)
+                _coeffs = list(_weights) if _weights is not None else [1.0] * len(_scales)
+            _active = [int(s) for s, c in zip(_scales, _coeffs) if float(c) > 0]
+            if _active:
+                _needed = 2 * max(_active) + 1
+                _base = self.cfg.num_hist + self.cfg.num_pred
+                if _needed > _base:
+                    _dataset_kwargs["num_frames"] = _needed
+                    log.info(
+                        "Multi-scale straightening: dataset window num_frames=%s "
+                        "(base num_hist+num_pred=%s) for ACTIVE scales=%s (lambda>0); needs "
+                        "trajectories >= %s env-steps (num_frames*frameskip).",
+                        _needed, _base, _active, _needed * self.cfg.frameskip,
+                    )
         self.datasets, traj_dsets = hydra.utils.call(
             self.cfg.env.dataset,
             **_dataset_kwargs,
@@ -427,6 +440,7 @@ class Trainer:
             straighten_scales=self.cfg.training.get("straighten_scales", None),
             straighten_scale_weights=self.cfg.training.get("straighten_scale_weights", None),
             straighten_goal_weight=self.cfg.training.get("straighten_goal_weight", 0.0),
+            straighten_lambdas=self.cfg.training.get("straighten_lambdas", None),
         )
         self._log_trainable_params(self.model, "model")
 

@@ -35,6 +35,7 @@ class VWorldModel(nn.Module):
         straighten_scales=None,
         straighten_scale_weights=None,
         straighten_goal_weight=0.0,
+        straighten_lambdas=None,
         **kwargs,
     ):
         super().__init__()
@@ -75,28 +76,67 @@ class VWorldModel(nn.Module):
                 self.straighten_scale = float(suffix) if suffix else 1.0
                 self.curvature_mode = "cos"
 
-        self.straighten = self.curvature_mode is not None and self.straighten_scale > 0
-
         # ---- Multi-scale (hierarchical) straightening config ----------------------
         # Backward compatible: scales == [1] reproduces the paper's single-scale
-        # (consecutive-frame) curvature loss exactly. Set e.g. [1, 3, 5, 10] to also
+        # (consecutive-frame) curvature loss exactly. Set e.g. [1, 4] to also
         # straighten at coarser temporal scales. Curvature at scale s needs >= 2s+1
         # latent frames in the window (enforced by the dataloader window length).
         if not straighten_scales:
             self.straighten_scales = [1]
         else:
             self.straighten_scales = [int(s) for s in straighten_scales]
-        if straighten_scale_weights is None:
+
+        # Per-scale coefficients. Two mutually-exclusive ways to specify them:
+        #   (A) straighten_lambdas: ABSOLUTE lambda per scale, e.g. [0.1, 0.2]. PREFERRED for
+        #       ablations. loss += sum_s lambda_s * L_curv^(s). straighten_lambdas takes
+        #       precedence and folds the global scale into 1.0, so the effective coefficient
+        #       equals the value you pass. Setting a lambda to 0 fully DISABLES that scale
+        #       (its loss term AND, via the dataloader, its window requirement) -> e.g.
+        #       lambdas=[0.1, 0] on scales=[1,4] is bit-identical to the paper's single-scale.
+        #   (B) straighten_scale_weights (legacy): multipliers on the global straighten_scale
+        #       parsed from the `straighten` string (aggcos1e-1 -> 0.1). Effective coefficient
+        #       is straighten_scale * w_s. Kept so earlier runs reproduce exactly.
+        if straighten_lambdas is not None:
+            assert len(straighten_lambdas) == len(self.straighten_scales), (
+                "straighten_lambdas must have the same length as straighten_scales"
+            )
+            self.straighten_scale = 1.0
+            self.straighten_scale_weights = [float(l) for l in straighten_lambdas]
+        elif straighten_scale_weights is None:
             self.straighten_scale_weights = [1.0] * len(self.straighten_scales)
         else:
             assert len(straighten_scale_weights) == len(self.straighten_scales), (
                 "straighten_scale_weights must have the same length as straighten_scales"
             )
             self.straighten_scale_weights = [float(w) for w in straighten_scale_weights]
+
         # weight mu of the optional directional (goal-aligned) term; 0 = disabled
         self.straighten_goal_weight = float(straighten_goal_weight)
-        # frames the training window must have so every requested scale fits
-        self.straighten_min_frames = 2 * max(self.straighten_scales) + 1
+
+        # Effective ABSOLUTE lambda per scale (= straighten_scale * weight); for logging/inspection.
+        self.straighten_effective_lambdas = [
+            self.straighten_scale * w for w in self.straighten_scale_weights
+        ]
+        # A scale is ACTIVE only if its coefficient > 0. lambda_s = 0 disables scale s entirely:
+        # no loss contribution here, and no window widening (see train.py) -> switching a scale
+        # off reverts both the loss and the data pipeline to the remaining active scales.
+        self.straighten_active_scales = [
+            s for s, w in zip(self.straighten_scales, self.straighten_scale_weights) if w > 0
+        ]
+
+        # Straightening runs only if a mode is set, the global scale > 0, and >= 1 scale is
+        # active. (All lambdas == 0 => straightening off => pure prediction loss.)
+        self.straighten = (
+            self.curvature_mode is not None
+            and self.straighten_scale > 0
+            and len(self.straighten_active_scales) > 0
+        )
+
+        # Training window must hold >= 2s+1 frames for the largest ACTIVE scale only.
+        if self.straighten_active_scales:
+            self.straighten_min_frames = 2 * max(self.straighten_active_scales) + 1
+        else:
+            self.straighten_min_frames = self.num_hist + self.num_pred
 
         log.info("num_action_repeat: %s", self.num_action_repeat)
         log.info("num_proprio_repeat: %s", self.num_proprio_repeat)
@@ -112,9 +152,11 @@ class VWorldModel(nn.Module):
                 self.straighten_scale,
             )
             log.info(
-                "Multi-scale straightening: scales=%s weights=%s goal_weight=%s (needs window>=%s frames)",
+                "Multi-scale straightening: scales=%s effective_lambdas=%s active_scales=%s "
+                "goal_weight=%s (needs window>=%s frames)",
                 self.straighten_scales,
-                self.straighten_scale_weights,
+                self.straighten_effective_lambdas,
+                self.straighten_active_scales,
                 self.straighten_goal_weight,
                 self.straighten_min_frames,
             )
@@ -352,6 +394,8 @@ class VWorldModel(nn.Module):
         total = None
         used = []
         for s, w in zip(self.straighten_scales, self.straighten_scale_weights):
+            if w == 0:
+                continue  # lambda=0 -> scale disabled (no loss term, no window requirement)
             c = self._scale_velocity_curvature(z, s)
             if c is None:
                 continue  # this scale doesn't fit the current window; skip it
