@@ -591,6 +591,14 @@ class Trainer:
         z_tgt: (b, n_hist, n_patches, emb_dim), doesn't include action dims
         state:  (b, n_hist, dim)
         """
+        # Align z_tgt to z_out's frame count (num_hist). z_out is the predictor output
+        # (num_hist frames); the caller passes z_tgt = z_gt[num_pred:], which under a
+        # multi-scale widened window (T > num_hist+num_pred) is longer than num_hist and
+        # would mismatch here. Take the first num_hist target frames (== the loss path's
+        # z[num_pred:num_pred+num_hist]). For the paper window (T == num_hist+num_pred) this
+        # is a no-op. Logging-only metric -- does not affect the training loss or the model.
+        _t_out = next(iter(z_out.values())).shape[1]
+        z_tgt = slice_trajdict_with_t(z_tgt, start_idx=0, end_idx=_t_out)
         logs = {}
         slices = {
             "full": (None, None),
