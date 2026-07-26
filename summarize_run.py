@@ -27,8 +27,15 @@ RESULTS_DIR = "results"
 
 
 def base_cell(name):
-    """Strip a trailing _seed<N> so training-seed variants share the base cell's paper target."""
-    return re.sub(r"_seed\d+$", "", name)
+    """Strip trailing setting/variant tags so every setting variant shares its base cell's
+    paper target: _ms<scales>, _lam<...>, _w<...>, _ep<N>, _seed<N> (any order/combination).
+    'pusht_..._lr1e-05_ms1-4_lam0.1-0.2_ep3' -> 'pusht_..._lr1e-05'."""
+    pat = re.compile(r"_(?:ms[0-9-]+|lam[0-9.\-]+|w[0-9.\-]+|ep\d+|seed\d+)$")
+    prev = None
+    while prev != name:
+        prev = name
+        name = pat.sub("", name)
+    return name
 
 # Paper Table 1 (GD planner) targets for the exact 5 cells we reproduce: (mean, std) %.
 PAPER = {
@@ -144,7 +151,9 @@ def rebuild_master():
         except Exception:
             pass
     order = {n: i for i, n in enumerate(PAPER)}
-    recs.sort(key=lambda r: order.get(r["run"], 999))
+    # Sort by base cell (so multi-scale / epoch variants group next to their paper cell),
+    # then by full run name (so variants of the same cell are listed together, deterministically).
+    recs.sort(key=lambda r: (order.get(base_cell(r["run"]), 999), r["run"]))
 
     md = ["# Table 1 reproduction (GD planner, 3 data seeds 100/200/300, 50 samples)",
           "",

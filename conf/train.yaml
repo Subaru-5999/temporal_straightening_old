@@ -15,9 +15,9 @@ ckpt_base_path: ./checkpoints
 
 hydra:
   run:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${run_variant_tag:${training.epochs},${training.seed}}
   sweep:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${run_variant_tag:${training.epochs},${training.seed}}
     subdir: ${hydra.job.num}
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j

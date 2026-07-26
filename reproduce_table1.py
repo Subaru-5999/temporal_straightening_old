@@ -84,9 +84,20 @@ ORDER = list(CFG)
 
 
 def base_cell(name):
-    """Strip a trailing _seed<N> so training-seed variants map to their base cell's
-    (alpha, mpc_mode) and paper targets. 'pusht_..._lr1e-06_seed2' -> 'pusht_..._lr1e-06'."""
-    return re.sub(r"_seed\d+$", "", name)
+    """Strip trailing setting/variant tags so every setting maps to its base Table-1 cell
+    for the (alpha, mpc_mode) lookup. Handles, in any order/combination:
+      _ms<scales>   (e.g. _ms1-4)      multi-scale scales
+      _lam<...>     (e.g. _lam0.1-0.2) per-scale lambdas
+      _w<...>       (e.g. _w1-2)       legacy per-scale weights
+      _ep<N>        (e.g. _ep3)        training epochs
+      _seed<N>      (e.g. _seed2)      training seed
+    'pusht_..._lr1e-05_ms1-4_lam0.1-0.2_ep3_seed1' -> 'pusht_..._lr1e-05'."""
+    pat = re.compile(r"_(?:ms[0-9-]+|lam[0-9.\-]+|w[0-9.\-]+|ep\d+|seed\d+)$")
+    prev = None
+    while prev != name:
+        prev = name
+        name = pat.sub("", name)
+    return name
 
 
 def clean_scoped(name):
