@@ -73,6 +73,13 @@ class Trainer:
 
         self.num_reconstruct_samples = self.cfg.training.num_reconstruct_samples
         self.total_epochs = self.cfg.training.epochs
+        # Optional hard cap on optimizer steps (mini-batches) for iteration-matched runs.
+        # null -> train the full `epochs` (paper default). global_step counts steps across
+        # epochs; _stop_training is flipped once the cap is hit so run() breaks the epoch loop.
+        _mts = self.cfg.training.get("max_train_steps", None)
+        self.max_train_steps = int(_mts) if _mts is not None else None
+        self.global_step = 0
+        self._stop_training = False
         self.epoch = 0
         self.decoder_start_epoch = int(self.cfg.training.get("decoder_start_epoch", 1))
         if self.decoder_start_epoch < 1:
@@ -547,6 +554,10 @@ class Trainer:
             self.accelerator.wait_for_everyone()
             self.val()
             self.logs_flash(step=self.epoch)
+            if self._stop_training and self.epoch % self.cfg.training.save_every_x_epoch != 0:
+                # Cap hit mid-epoch on an epoch that wouldn't otherwise save: force a save so
+                # the iteration-matched checkpoint is always persisted for planning.
+                self.save_ckpt()
             if self.epoch % self.cfg.training.save_every_x_epoch == 0:
                 ckpt_path, model_name, model_epoch = self.save_ckpt()
                 # main thread only: launch planning jobs on the saved ckpt
@@ -577,6 +588,12 @@ class Trainer:
                     )
                     with lock:
                         self.job_set.update(jobs)
+
+            if self._stop_training:
+                # max_train_steps reached mid-epoch: checkpoint + val already done above.
+                log.info("Stopping epoch loop at epoch %s (global_step=%s).",
+                         self.epoch, self.global_step)
+                break
 
     def err_eval_single(self, z_pred, z_tgt):
         logs = {}
@@ -723,6 +740,21 @@ class Trainer:
             ):
                 self.logs_flash_iter(iteration=i)
                 self.save_ckpt()
+
+            # Iteration-matched cap: count this optimizer step and stop the moment we reach
+            # max_train_steps (may be mid-epoch). run() sees _stop_training and breaks the
+            # epoch loop after the usual end-of-epoch val()+save. No-op when the cap is null.
+            self.global_step += 1
+            if (
+                self.max_train_steps is not None
+                and self.global_step >= self.max_train_steps
+            ):
+                self._stop_training = True
+                log.info(
+                    "Reached max_train_steps=%s at epoch %s (batch %s); stopping training.",
+                    self.max_train_steps, self.epoch, i,
+                )
+                break
 
     @torch.no_grad()
     def val(self):

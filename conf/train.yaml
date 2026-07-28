@@ -34,6 +34,13 @@ training:
   batch_size: 32 # should >= nodes * tasks_per_node
   save_every_x_epoch: 1
   save_every_x_iterations: 1000
+  # Optional HARD cap on the number of optimizer steps (mini-batches). null = train the full
+  # `epochs` (paper default, unchanged). When set, training stops the moment this many steps
+  # have run -- even mid-epoch -- then saves + validates once. Purpose: ITERATION-MATCHED
+  # comparison. The multi-scale s=4 3-epoch run does 141,996 steps (47,332/epoch on the 9-frame
+  # window); to give the paper baseline (4-frame window, ~61,929/epoch) the SAME budget, run it
+  # with epochs=3 max_train_steps=141996 (2 full epochs + 18,138 steps into epoch 3).
+  max_train_steps: null
   straighten: False  # e.g. cos1e-2 or aggcos1e-2
   # ---- Multi-scale (hierarchical) straightening: NOVEL extension, single-scale by default ----
   # straighten_scales=null (or [1]) reproduces the paper exactly. Set e.g. [1,3,5,10] to also
