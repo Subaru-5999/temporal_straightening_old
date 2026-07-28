@@ -419,3 +419,252 @@ tr '\r' '\n' < train_pusht_multiscale.log | \
   GD vs CEM (show reduced reliance on samplers), Hessian condition-number analysis.
 - Run the same extension on **PointMaze/UMaze** (note len-100 trajectories only support small
   scales; `max_scale=10` needs ≥105-step trajectories, so UMaze can only use smaller scales).
+
+---
+
+## 11. DEFINITIVE drift conclusion (canonical — supersedes scattered notes in §8–§9)
+
+Full reproduction, all 4 tracked PushT/UMaze cells, 3 data-sampling seeds each, single training
+seed 0, on the B200 MIG pod. This is the authoritative drift table + explanation.
+
+| Env | Cell | Metric | Ours | Paper | Δ | Verdict |
+|---|---|---|---|---|---|---|
+| UMaze | patch 14×14×384, ✗ (frozen, no projector) | OL | 38.00±3.46 | 35.33±4.11 | +2.67 | in band |
+| UMaze | patch 14×14×384, ✗ (frozen) | MPC | 87.33±2.31 | 80.67±6.18 | +6.66 | in band |
+| UMaze | +proj 14×14×8, ✗ (trainable projector) | OL | 58.00±5.29 | 44.00±7.12 | +14.0 | OUT (high) |
+| UMaze | +proj 14×14×8, ✗ (trainable) | MPC | 92.67±1.15 | 81.33±6.80 | +11.3 | OUT (high) |
+| UMaze | +proj 14×14×8, ✓ (straighten) | OL | 90.67±1.15 | 94.00±1.63 | −3.33 | in band |
+| UMaze | +proj 14×14×8, ✓ | MPC | 100.0±0.0 | 100.0±0.0 | 0 | exact |
+| PushT | +proj 14×14×8, ✗ (trainable) | OL | 76.00±4.00 | 70.00±1.63 | +6.0 | OUT (high) |
+| PushT | +proj 14×14×8, ✗ (trainable) | MPC | 82.00±5.29 | 78.67±0.94 | +3.33 | overlaps |
+| PushT | +proj 14×14×8, ✓ (straighten) | OL | 75.33±6.11 | 77.33±6.18 | −2.0 | in band |
+| PushT | +proj 14×14×8, ✓ (straighten) | MPC | 82.00±2.00 | 85.33±4.99 | −3.33 | in band |
+
+**Drift ordering (the key clue):** frozen ✗ drifts least (+2.67 OL) → trainable-projector ✗
+drifts most (+14, +6, OUT) → trainable-projector ✓ back in band. Drift concentrates exactly on
+the trainable-representation, no-straightening cells.
+
+**Root cause (by elimination):** the only uncontrolled variable is the GPU's bf16 arithmetic.
+B200 (Blackwell, 5th-gen TC) + torch 2.7 / cuDNN 9.7 vs paper's H100 (Hopper, 4th-gen) + torch
+2.3 / cuDNN 8.9 → same code lands on a slightly different trained model. Amplified into a large
+success swing only on the ✗-trainable cells by two paper mechanisms:
+1. **Implicit straightening (§5.2):** ✗-trainable cells get performance from a training-dynamics-
+   dependent implicit straightening — the exact thing GPU arithmetic perturbs. Frozen ✗ has
+   nothing trainable to shape → least drift. ✓ cells force straightening → don't rely on the
+   fragile implicit effect → stable.
+2. **Conditioning (Theorem 4.4):** without straightening the planning objective is ill-conditioned
+   → tiny weight change → large success swing. With straightening it's well-conditioned → stable.
+
+**Ruled out (do not re-chase):** TF32 (inert under bf16), data/data-order (deterministic, split
+seed 42 + shuffle after seed 0), evaluation (deterministic, identical on re-run, same 50 tasks),
+code/protocol/hyperparams (byte-identical to authors' zip), the method itself (✓ cells reproduce
+in band = the paper's actual claim). ⇒ drift is baked into the TRAINED WEIGHTS, hardware-origin.
+
+**One-line:** B200/torch-2.7 vs H100/torch-2.3 → slightly different model → paper's own math
+(implicit straightening + ill-conditioned planning) amplifies it into a large swing on exactly the
+no-straightening cells; straightening cells reproduce faithfully. Not a misconfiguration.
+
+**Newly pinned baseline (for the multi-scale comparison):** single-scale ✓ PushT on this B200 =
+**OL 75.33±6.11, MPC 82.00±2.00**. Multi-scale s=4 (λ₂=0.2, 3 ep) = OL 76.67±6.43, MPC 88.00±3.46.
+MPC gain +6.0 → t≈2.6, p≈0.06 two-sided; borderline significant, still confounded by epochs (3 vs
+2) and single training seed. Matched-epoch single-scale run + a 2nd training seed would lock it.
+
+---
+
+## 12. Independent per-scale λ, per-setting folders, and the has_decoder+multiscale crash fix
+
+Work done after §10/§11, all config-gated and paper-faithful (verified line-by-line against the
+paper's LaTeX `sec/1_main.tex`: Eqs 5–7, stop-grad, agg head, detached decoder, OL/MPC objectives).
+
+### 12.1 Independent per-scale λ (`straighten_lambdas`) — commit `86c585c`
+- Added `straighten_lambdas` (absolute λ per scale) to `VWorldModel` + `conf/train.yaml` + `train.py`.
+  `loss = MSE + Σ_s λ_s·L_curv^(s)`. Takes precedence over the legacy `straighten_scale_weights`
+  (which was over-parameterized: only the product `straighten_scale·w_s` was identifiable).
+- **λ_s = 0 fully disables scale s**: `total_curvature` skips `w==0`; the training window is widened
+  only for **active** scales (λ>0) — so `straighten_scales=[1,4] straighten_lambdas=[0.1,0]` reverts
+  to the paper's loss AND 4-frame window (bit-identical). Fixes the earlier "λ=0 doesn't shrink the
+  data window" redundancy.
+- Backward compatible: `straighten_lambdas=null` → falls back to `straighten_scale × weights`;
+  default single-scale `[1]` = paper. Verified with 7 scenarios.
+
+### 12.2 Per-setting checkpoint folders — commits `cd1af2a`, `ec5d65a`
+- `custom_resolvers.py`: `straighten_tag` (appends `_ms1-4_lam0.1-0.2` etc.; empty for paper default)
+  and `run_variant_tag` (appends `_ep<N>` always; `_seed<N>` only if seed≠0).
+- `hydra.run.dir` now encodes the full setting → each config lands in its OWN folder (no collisions;
+  self-documenting; directly reusable as the HF sub-path). Paper default folder name unchanged.
+- `reproduce_table1.py` + `summarize_run.py`: `base_cell` now strips `_ms/_lam/_w/_ep/_seed` tags so
+  variants still map to their Table-1 cell for the (alpha, mpc_mode) + paper-target lookup. Planning
+  outputs inherit the tag via `model_name` → results are distinguishable per setting.
+- Example folders: paper 2ep `..._lr1e-05_ep2`; multi-scale `..._ms1-4_lam0.1-0.2_ep3`; seed variant
+  `..._ep3_seed1`. Fixes the earlier 2-epoch-vs-3-epoch collision.
+
+### 12.3 The `has_decoder=true` + multi-scale crash — commit `149382f` (ROOT CAUSE + FIX)
+- **Symptom**: `RuntimeError: size of tensor a (3) must match b (8) at dim 1` in `mse_loss`, on the
+  first batch, only with `has_decoder=true` + a widened multi-scale window (9-frame). All prior
+  multi-scale runs used `has_decoder=false`, which skipped the failing block → never seen before.
+- **Root cause (from traceback)**: NOT the loss/decoder. It's `train.py err_eval` — a *logging-only*
+  reconstruction-error metric (feeds wandb, disabled), run only when `decoder_active and plot`.
+  It compares the predictor output `z_obs_out` (num_hist=3 frames) against
+  `z_tgt = slice_trajdict_with_t(z_gt, start_idx=num_pred)` = `z_gt[1:]` = **8 frames** for the
+  9-frame window. In the paper's 4-frame window `z_gt[1:]` = 3 frames, so it always matched before.
+- **Fix**: inside `err_eval`, cap `z_tgt` to `z_out`'s frame count (`slice[0:num_hist]`) — the same
+  frames the loss path uses. **No-op for the paper window**; logging-only; does NOT touch the loss,
+  the model, or the eval. Two call sites (`train()` + `val()`) fixed centrally.
+- **Not a methodology change**: `err_eval` is a diagnostic, never added to `loss` / never backprops.
+
+### 12.4 Paper-faithfulness re-verification (against `sec/1_main.tex`)
+All recent edits are no-ops on the paper path or are logging/naming/loader plumbing:
+- `forward` z_tgt/visual_tgt cap → for T=4, `z[1:4]` == original `z[1:]` (bit-identical).
+- `err_eval` cap → logging-only, no-op for T=4.
+- `straighten_lambdas` → off by default = paper single-scale.
+- folder tags + `base_cell` → cosmetic/eval-mapping.
+- `plan.py` None-skip → loader robustness for `has_decoder=false`.
+- Decoder is detached (`decode(z.detach())`) — matches paper L382 "decoder detached, interpretability only".
+
+### 12.5 The matched-comparison run plan (paper-faithful except epochs + multi-scale)
+Both PushT ✓, 3 epochs, decoder ON, B200/MIG recipe; distinct auto-tagged folders:
+- **Run 1 (multi-scale s=4)**: `env=pusht encoder=dino_channel training.straighten=aggcos1e-1
+  training.encoder_lr=1e-5 training.epochs=3 'training.straighten_scales=[1,4]'
+  'training.straighten_lambdas=[0.1,0.2]' ckpt_base_path=$PWD/checkpoints`
+  → `..._ms1-4_lam0.1-0.2_ep3`.
+- **Run 2 (single-scale paper)**: same minus the scales/lambdas → `..._ep3`.
+- Eval each with `reproduce_table1.py <folder> --base $PWD/checkpoints/test`.
+- **Caveats**: epoch-matched (not update-matched: single-scale ~186k vs multi-scale ~142k updates,
+  since multi-scale windows are fewer/longer); judge on MPC (OL is short-horizon insensitive);
+  single training seed (confirm any MPC gain with `training.seed=1`); watch B200 45GB OOM with
+  decoder ON + 9-frame window (fallback `has_decoder=false` on BOTH, inert for results).
+- **Prior s=4 result (has_decoder=false, λ₂=0.2, 3ep)**: OL 76.67±6.43, MPC 88.00±3.46 vs single-scale
+  ✓ 2ep 75.33/82.00 and matched 3ep 70.67/84.67 — MPC gain shrinks to +3.33 (n.s.) once epoch-matched.
+
+---
+
+## 13. Seed methodology — SETTLED (see `PAPER_TABLE1_METHODOLOGY.md`)
+
+**Canonical reference file: `PAPER_TABLE1_METHODOLOGY.md`** (grounded in `sec/1_main.tex`,
+`sec/2_appendix.tex`, and `plan.py`, verified line-by-line). Consult it whenever the "how many
+seeds / do we need more training seeds?" question comes up.
+
+One-line: **the paper trains ONE model per Table-1 cell and reports mean ± std over THREE
+DATA-SAMPLING seeds** (the `plan.py` `eval_seed = seed*n+1` that redraws the 50 test start/goal
+pairs) — **NOT multiple training seeds.** No `training seed` / `retrain` / `independent runs`
+language exists anywhere in the tex.
+
+**Exact values (verified in code):** the 3 data seeds are **100, 200, 300** (`reproduce_table1.py`
+L73 `SEEDS = [100, 200, 300]`); test tasks per seed = **50** (`n_evals: 50` in all `conf/plan_*.yaml`;
+`plan.py` L287 loops 50) — matches the paper's "50 test samples". NOT 5 (the 5s are H=goal_H/frameskip
+=25/5 and MPC's 5 executed actions, not the test-task count).
+
+Consequences (do not re-litigate):
+- Our protocol (train once at `training.seed=0`; eval data seeds 100/200/300; mean±std) **matches
+  the paper exactly** → our multi-scale vs single-scale numbers (both 3 data seeds) are already a
+  paper-consistent comparison. Multi-scale s=4 3ep = OL 76.67±6.43 / MPC 88.00±3.46 vs single-scale
+  75.33/82.00 (2ep) and 70.67/84.67 (3ep matched).
+- **Multiple training seeds are NOT required to be paper-faithful** (that's a higher bar than the
+  paper). They're optional extra rigor only if a reviewer challenges the novel multi-scale claim.
+- Corrects earlier repeated advice in this log that implied training-seed averaging was needed for
+  "significance" — it is beyond the paper's own standard.
+
+## 14. Iteration-matched paper baseline — `training.max_train_steps` knob (commit 209cafd)
+
+**Goal.** Build the *iteration-matched* paper baseline for the multi-scale comparison: run the
+paper's single-scale straightening (its exact 4-frame window + loss) for the **same number of
+optimizer steps** as the multi-scale s=4 3-epoch run, so any success-rate difference is
+attributable to the coarse-scale term, not to training length. Everything except the iteration
+budget must match the paper.
+
+### 14.1 The exact iteration count (derived + cross-checked)
+- Window formula (`datasets/traj_dset.py`, §10.8): `windows/traj = max(0, T − num_frames·frameskip + 1)`.
+- PushT training set = **18,685 rollouts** (confirmed in eval log: "Loaded 18685 rollouts"); all
+  trajectories are ≥45 env-steps, so none are dropped at either window size.
+- **Single-scale / paper** (`num_frames = num_hist+num_pred = 4`, frameskip 5 → 20-step window):
+  `T−19` windows/traj → **61,929 iters/epoch** (authoritative, `REPRODUCTION.md`).
+- **Multi-scale s=4** (`num_frames = 2·4+1 = 9`, frameskip 5 → 45-step window): `T−44` windows/traj.
+  Loses exactly `44−19 = 25` windows/traj vs single-scale:
+  - single total windows ≈ 61,929×32 = 1,981,728
+  - multi  total windows ≈ 1,981,728 − 25×18,685 = 1,514,603 → /32 = **47,332 iters/epoch** (matches
+    the figure recorded earlier — cross-check passes).
+- ⇒ **Multi-scale 3 epochs = 47,332×3 = 141,996 steps** (this is "our loss in 3 epochs").
+  Single-scale: 2 ep = 123,858; 3 ep = 185,787. So 141,996 = **2 full paper epochs + 18,138 steps
+  into epoch 3** (= 2.293 epochs) → NOT an integer epoch count.
+
+### 14.2 The trilemma (why a code knob was unavoidable)
+You cannot have all three: (a) paper 4-frame window, (b) exactly 141,996 steps, (c) no code change —
+because 141,996 is not a multiple of 61,929, so hitting it exactly means stopping **mid-epoch**,
+which the epoch-driven loop can't do without a stop-at-N-steps knob. User chose to add the knob
+(Option B). (Option A = bracket with 2ep/3ep baselines, already have it; Option C = force 9-frame
+window on single-scale via `+env.dataset.num_frames=9` with epochs=3, no code but not the paper's
+4-frame window. Both rejected in favor of the exact paper-window match.)
+
+### 14.3 What was implemented — `training.max_train_steps` (commit 209cafd, pushed to main)
+Minimal, backward-compatible, **default `null` = paper behavior unchanged** (2 files, +39 lines):
+- `conf/train.yaml`: new `max_train_steps: null` under `training:` (with comment block).
+- `train.py` constructor (~L75): `self.max_train_steps = int(_mts) if _mts is not None else None`,
+  `self.global_step = 0`, `self._stop_training = False`.
+- `train.py` `train()` batch loop end (~L744): after each optimizer step `self.global_step += 1`;
+  if `max_train_steps is not None and global_step >= max_train_steps` → set `_stop_training=True`,
+  log `Reached max_train_steps=... at epoch N (batch i)`, `break`.
+- `train.py` `run()` epoch loop (~L554, L589): after the normal end-of-epoch `val()`+`save_ckpt()`,
+  a force-save guard (only fires if `save_every_x_epoch>1`) + `if self._stop_training: break`.
+- Flow when cap hits: finish current batch → break batch loop → run `val()` → `save_ckpt()` →
+  break epoch loop. Checkpoint saved is the model at exactly 141,996 steps.
+- `global_step` counts tqdm mini-batches (= optimizer steps; single GPU, gpu_batch_size=32 → 1
+  batch = 1 step), the same unit as 47,332 / 61,929, so the match is exact in those units.
+- NOTE: this is a DIFFERENT change from the earlier `straighten_window` edits, which were fully
+  reverted and never committed. §14 is only the step-cap knob.
+
+### 14.4 The run command (paper baseline via λ₂=0, matched to 141,996)
+```bash
+cd /workspace/arun/temporal_straightening_old
+export DATASET_DIR=/workspace/arun/data
+export WANDB_MODE=offline
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+setsid nohup python train.py --config-name train.yaml env=pusht encoder=dino_channel \
+  training.straighten=aggcos1e-1 training.encoder_lr=1e-5 training.epochs=3 env.num_workers=4 \
+  'training.straighten_scales=[1,4]' 'training.straighten_lambdas=[0.1,0]' \
+  training.max_train_steps=141996 \
+  ckpt_base_path=$PWD/checkpoints_baseline_matched \
+  > train_pusht_baseline_matched_141996.log 2>&1 < /dev/null &
+tail -f train_pusht_baseline_matched_141996.log
+```
+- `straighten_lambdas=[0.1,0]` on `scales=[1,4]` = **bit-identical to paper single-scale**: scale 4
+  (λ=0) is skipped in `total_curvature` AND doesn't widen the window (`needed=3 < base=4`), so window
+  stays 4 frames and loss = `MSE + 0.1·L1`. Same as plain `straighten=aggcos1e-1` with no scales.
+- All paper variables verified against `REPRODUCTION.md`/Table 3: encoder_lr 1e-5 (✓ straightening),
+  predictor/proprio/action lr 5e-4, batch 32, num_hist 3, num_pred 1, frameskip 5, stop_grad True,
+  bf16, seed 0, vcreg off, goal_weight 0. **Only epochs/iterations deviate (intended).**
+- `env.num_workers=4` = non-paper DataLoader knob, results-neutral (`REPRODUCTION.md`).
+- Shell exports matter: `DATASET_DIR` required; `WANDB_MODE`/`PYTORCH_CUDA_ALLOC_CONF` are
+  logging/MIG-allocator only (no effect on numerics). MUJOCO_GL/EGL/PLAN_SERIAL_ENV are
+  planning-only, not needed for training.
+
+### 14.5 Save location (Hydra run dir from the tag resolvers)
+```
+$PWD/checkpoints_baseline_matched/test/pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05_ms1-4_lam0.1-0_ep3/checkpoints/model_latest.pth
+```
+- `aggmlpcos1e-1` (agg_type=mlp folded into the straighten string), `_ms1-4_lam0.1-0` (straighten_tag),
+  `_ep3` (run_variant_tag). `max_train_steps` is NOT encoded in the folder name → isolate it via its
+  own `ckpt_base_path` root (done). `base_cell` strips `_ms/_lam/_ep` → maps to the PushT straighten
+  cell (alpha=1, staged) for eval.
+- Training log lands in the shell cwd: `.../temporal_straightening_old/train_pusht_baseline_matched_141996.log`.
+
+### 14.6 Eval command
+```bash
+python reproduce_table1.py \
+  pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05_ms1-4_lam0.1-0_ep3 \
+  --base $PWD/checkpoints_baseline_matched/test
+```
+
+### 14.7 Verification checks (in the training log)
+- Epoch-1 tqdm total ≈ **`/61929`** (paper 4-frame window; NOT 47,332 — confirms λ₂=0 reverted the window).
+- Stop line: **`Reached max_train_steps=141996 at epoch 3 (batch 18137)`** (i is 0-based:
+  2×61,929=123,858 done; epoch-3 stops when global_step=141,996 → i+1=18,138 → i=18137).
+
+### 14.8 PITFALL hit on the pod (RESOLVED) — pull before running
+Symptom: `Could not override 'training.max_train_steps'. Key 'max_train_steps' is not in struct`.
+Cause: the pod was on old code (hadn't pulled 209cafd), so the yaml key + train.py logic weren't
+present. Fix: `git pull` on the pod (`grep -n max_train_steps conf/train.yaml` must show
+`max_train_steps: null`; `git log --oneline -1` = 209cafd), then the plain
+`training.max_train_steps=141996` works. **Do NOT use the `+training.max_train_steps=...` append
+workaround** — it lets the override through but the enforcement lives in `train.py`, so without the
+pull the cap is silently ignored and it trains all 3 full epochs (185,787 steps). Both files must
+update together via the pull.
