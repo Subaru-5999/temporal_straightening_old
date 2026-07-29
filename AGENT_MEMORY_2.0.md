@@ -707,3 +707,44 @@ update together via the pull.
   (now clearly the bottleneck, not the loss term); (2) other envs (PointMaze/Wall, longer/curvier
   trajectories). Manage expectations: the clean single-task result is null.
 - Master table: `results/table1_reproduction.md`/`.csv` now holds all 3 multi-scale/baseline rows.
+
+## 16. Long-horizon evaluation of multi-scale (DESIGN + derivation; results pending)
+
+**Goal.** Test whether the multi-scale coarse term helps where the theory says it should — LONG planning
+horizons — using the already-trained checkpoints (NO retraining). At H=5 the two tied (§15); the
+hypothesis is a gap opens as H grows.
+
+### 16.1 Sweet-spot H derivation (from the loss + Thm 1)
+- frameskip=5 → 1 model step = 5 env-steps. Loss scales s=1,4 (latent-frame gaps) → fine scale = 1
+  model step (5 env-steps), coarse scale s=4 = **4 model steps (20 env-steps)**.
+- Paper conditioning law κ_eff(H) ~ ρ^{2(H-1)}, ρ=(1+ε)/(1-ε). Single-scale shrinks ε over 1-step
+  spans; the coarse term shrinks effective curvature over 4-step spans, so it only ACTS once the
+  horizon traverses its reach:
+  - H≤4: coarse term irrelevant → tie (matches observed H=5 tie).
+  - H≈8–12 (=2–3× coarse reach): coarse term fully engaged → best chance of a gap. **Sweet spot.**
+  - H≳15: model trained num_pred=1 → autoregressive rollout error dominates, washes out signal.
+- **Sweet spot H* ≈ 8–12 → goal_H ≈ 40–60; primary bet H=10 (goal_H=50, the paper's long-horizon
+  point).** Sweep H=5(anchor)/8/10/12/15 → goal_H 25/40/50/60/75 (all divisible by frameskip 5).
+- CAVEAT: Thm 1 is proven for s=1 only; coarse-scale benefit is a heuristic extension, not guaranteed.
+
+### 16.2 KEY metric choice — OPEN-LOOP, not MPC
+The conditioning theorem is about optimizing a FULL length-H action sequence in one shot = exactly
+open-loop GD (`GDPlanner` builds a length-`horizon` action tensor). MPC deliberately uses a short
+5-step receding lookahead + replans, so it NEVER sees the long-horizon conditioning problem the loss
+targets. ⇒ the effect (if real) shows up in OPEN-LOOP. Open-loop is also the cheap one (~1.5 min/seed).
+
+### 16.3 Command mechanics (verified in plan.py / gd.py / mpc.py)
+- `plan.py`: goal_H_model_steps = goal_H//frameskip (L180); n_taken_actions//=frameskip (L184);
+  sub_planner.horizon//=frameskip (L186); self.planner.horizon set to goal_H_model_steps (L204).
+- For a longer OPEN-LOOP horizon, scale all three together (env-step units): set
+  `goal_H=G planner.sub_planner.horizon=G planner.n_taken_actions=G` (open-loop executes the full
+  horizon). Output auto-separates per H: `plan_outputs_gd/<model>_gH<G>_dset/...` (goal_H in folder).
+- Sweep = 2 models × {25,40,50,60,75} × seeds {100,200,300}. ~45–60 min for the open-loop pass.
+- Watch the TREND: (multi-scale − baseline) success vs H. A monotone widening gap = real signal;
+  flat gap = coarse term adds nothing. Single numbers are noise (§ power analysis).
+- Checkpoints: baseline = checkpoints_baseline_matched/test/pusht_...ms1-4_lam0.1-0_ep3;
+  multi-scale = checkpoints_s4/test/pusht_...ms1-4_lam0.1-0.2_ep3 (CONFIRM exact folder via
+  `ls -d checkpoints*/test/pusht_*ep3`; the two model_names MUST differ or plan_outputs collide).
+- MPC (staged) is the expensive optional follow-up (~12h full) ONLY if open-loop shows a widening gap.
+
+### 16.4 Status: commands issued to user; awaiting open-loop sweep results.
