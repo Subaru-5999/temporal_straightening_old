@@ -203,6 +203,16 @@ class PlanWorkspace:
 
         self.planner.horizon = self.goal_H_model_steps
 
+        # Optional memory-bounding: split the eval batch into chunks during GD planning.
+        # Each eval is independent (per-sample objective), so chunking is numerically
+        # identical to a single batch -- it only bounds peak memory for long-horizon
+        # rollouts on small GPUs / MIG slices. null = no chunking (original behavior).
+        _chunk = self.cfg_dict.get("plan_chunk_size", None)
+        if _chunk is not None:
+            self.planner.plan_chunk_size = _chunk
+            if hasattr(self.planner, "sub_planner"):
+                self.planner.sub_planner.plan_chunk_size = _chunk
+
         self.dump_targets()
 
     def prepare_targets(self):

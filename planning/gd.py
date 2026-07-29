@@ -96,6 +96,29 @@ class GDPlanner(BasePlanner):
         return None
 
     def plan(self, obs_0, obs_g, actions=None, step=None):
+        """Optionally split the eval batch into memory-bounded chunks, then delegate to
+        `_plan_batch`. Each eval is independent (per-sample objective + per-sample action
+        sequence), so chunking is numerically identical to a single batch -- it only bounds
+        peak GPU memory for long-horizon rollouts. `plan_chunk_size` null/0/>=n_evals ->
+        single batch (original, paper-faithful behavior)."""
+        chunk = getattr(self, "plan_chunk_size", None)
+        n_evals = obs_0["visual"].shape[0]
+        if not chunk or int(chunk) <= 0 or int(chunk) >= n_evals:
+            return self._plan_batch(obs_0, obs_g, actions=actions, step=step)
+        chunk = int(chunk)
+        out = []
+        for i in range(0, n_evals, chunk):
+            sl = slice(i, i + chunk)
+            obs_0_c = {k: v[sl] for k, v in obs_0.items()}
+            obs_g_c = {k: v[sl] for k, v in obs_g.items()}
+            actions_c = actions[sl] if actions is not None else None
+            a, _ = self._plan_batch(obs_0_c, obs_g_c, actions=actions_c, step=step)
+            out.append(a.detach())
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return torch.cat(out, dim=0), np.full(n_evals, np.inf)
+
+    def _plan_batch(self, obs_0, obs_g, actions=None, step=None):
         """
         Args:
             actions: normalized

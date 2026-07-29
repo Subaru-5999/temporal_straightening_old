@@ -24,6 +24,10 @@ model_epoch: latest
 
 seed: 100
 n_evals: 50
+# GD eval-batch chunk size. null = plan all n_evals in one batch (original/paper-faithful).
+# Set e.g. 10 to split planning into memory-bounded sub-batches (identical results, lower
+# peak memory) so long-horizon rollouts fit small GPUs / MIG slices without dropping n_evals.
+plan_chunk_size: null
 goal_source: 'dset'
 goal_H: 25 
 n_plot_samples: 10
