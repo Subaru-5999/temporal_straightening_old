@@ -668,3 +668,42 @@ present. Fix: `git pull` on the pod (`grep -n max_train_steps conf/train.yaml` m
 workaround** — it lets the override through but the enforcement lives in `train.py`, so without the
 pull the cap is silently ignored and it trains all 3 full epochs (185,787 steps). Both files must
 update together via the pull.
+
+## 15. DECISIVE RESULT — multi-scale gain does NOT survive iteration matching (PushT)
+
+**The iteration-matched experiment from §14 is complete. It overturns the earlier apparent MPC gain.**
+
+### 15.1 The numbers (all PushT ✓, single training run, mean±std over 3 data seeds 100/200/300, 50 tasks)
+| Run | Steps | Window | Loss | Open-loop | MPC |
+|---|---|---|---|---|---|
+| Multi-scale s=4 3ep | 141,996 | 9-frame | MSE+0.1·L1+0.2·L4 | 76.67±6.43 (72,84,74) | 88.00±3.46 |
+| **Iter-matched baseline** (`ms1-4_lam0.1-0_ep3`, cap 141996) | 141,996 | 4-frame (paper) | MSE+0.1·L1 | 74.67±6.43 (72,82,70) | **88.67±6.11 (94,82,90)** |
+| Single-scale 2ep (paper setting) | ~124k | 4-frame | MSE+0.1·L1 | 75.33±6.11 | 82.00±2.00 |
+| Single-scale 3ep | ~186k | 4-frame | MSE+0.1·L1 | 70.67±1.15 | 84.67±4.62 |
+| Paper ✓ reported | ~124k | 4-frame | MSE+0.1·L1 | 77.33±6.18 | 85.33±4.99 |
+
+### 15.2 Verdict — NULL result at matched compute
+- **Both runs at EXACTLY 141,996 steps:** OL 76.67 vs 74.67 (+2.0, bands overlap → tie);
+  MPC 88.00 vs **88.67 (baseline nominally HIGHER by 0.67)**, bands overlap → tie.
+- ⇒ **The multi-scale coarse-scale (L4) term provides NO measurable benefit on PushT at matched
+  training budget.** The earlier "+3.33 MPC gain" was an artifact of comparing against baselines at
+  DIFFERENT (non-matched) budgets.
+
+### 15.3 Why the earlier "gain" was not real (correction to §10/§14 optimism)
+- Single-scale MPC across budgets is non-monotonic and noisy: 124k→82.00, **142k→88.67**, 186k→84.67.
+  No trend; bounces ±3–4 pts. The matched baseline's own MPC seeds (94/82/90, ±6.11) span 12 points.
+- ⇒ **single-training-run variance is LARGER than the effect we were chasing.** The bracketing
+  argument (§ earlier: "88 beats 82 and 84.67") was inside that noise; the iteration-matched control
+  exposed it. This is the value of having run the control — a trustworthy negative.
+
+### 15.4 Implications
+- As a POSITIVE claim ("multi-scale straightening helps planning"), **NOT supported** by PushT at
+  matched compute. Do not frame it as an improvement; a reviewer running this exact control reaches
+  the same null. Be honest about this.
+- Reproduction itself is solid: BOTH runs land within the paper band (`[OK]` on OL and MPC vs
+  77.33±6.18 / 85.33±4.99). It's the EXTENSION that shows no value, not the reproduction.
+- One task, single training run each, high variance → a null here, not proof multi-scale can't help.
+  Only credible next steps: (1) multiple TRAINING seeds (3+) per arm to actually measure variance
+  (now clearly the bottleneck, not the loss term); (2) other envs (PointMaze/Wall, longer/curvier
+  trajectories). Manage expectations: the clean single-task result is null.
+- Master table: `results/table1_reproduction.md`/`.csv` now holds all 3 multi-scale/baseline rows.
