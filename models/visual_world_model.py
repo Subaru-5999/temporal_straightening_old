@@ -393,6 +393,12 @@ class VWorldModel(nn.Module):
         #   L_multi = sum_s  w_s * L_curv^(s)
         total = None
         used = []
+        # Per-scale RAW curvature values (before the lambda weighting), stashed for logging.
+        # Diagnostic for the redundancy question: if a coarse scale's L_curv^(s) is already
+        # ~0 while L_curv^(1) is clearly positive, that scale is implied by the fine scale
+        # (telescoping: v^(s) is a sum of s consecutive fine velocities) and contributes
+        # almost no gradient regardless of its lambda.
+        self._last_scale_curvatures = {}
         for s, w in zip(self.straighten_scales, self.straighten_scale_weights):
             if w == 0:
                 continue  # lambda=0 -> scale disabled (no loss term, no window requirement)
@@ -400,6 +406,7 @@ class VWorldModel(nn.Module):
             if c is None:
                 continue  # this scale doesn't fit the current window; skip it
             used.append(s)
+            self._last_scale_curvatures[f"curv_s{s}"] = c.detach()
             total = (w * c) if total is None else (total + w * c)
         if total is None:
             raise ValueError(
@@ -500,6 +507,9 @@ class VWorldModel(nn.Module):
                 curvature_loss = self.total_curvature(feats, mode=self.curvature_mode)
                 loss = loss + curvature_loss * self.straighten_scale
                 loss_components["curvature_loss_used_for_training"] = curvature_loss
+                # Per-scale raw curvatures (logging only; detached, does not affect the loss).
+                for _k, _v in getattr(self, "_last_scale_curvatures", {}).items():
+                    loss_components[_k] = _v
         else:
             visual_pred = None
             z_pred = None
