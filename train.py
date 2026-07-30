@@ -963,10 +963,23 @@ class Trainer:
         epoch_log["epoch"] = step
         log.info(f"Epoch {self.epoch}  Training loss: {epoch_log['train_loss']:.4f}  \
                 Validation loss: {epoch_log['val_loss']:.4f}")
+        self._log_scale_curvatures(epoch_log, f"Epoch {self.epoch}")
 
         if self.accelerator.is_main_process:
             self.wandb_run.log(epoch_log)
         self.epoch_log = OrderedDict()
+
+    def _log_scale_curvatures(self, log_dct, prefix):
+        """Print per-scale raw curvature L_curv^(s) to the LOG FILE. These otherwise only go
+        to wandb, which is disabled for headless runs -- so without this the multi-scale
+        redundancy diagnostic would be invisible. Purely informational."""
+        curv = {k: v for k, v in log_dct.items() if "curv_s" in k}
+        if curv:
+            log.info(
+                "%s per-scale curvature: %s",
+                prefix,
+                "  ".join(f"{k}={v:.6f}" for k, v in sorted(curv.items())),
+            )
 
     def logs_flash_iter(self, iteration):
         iter_log = OrderedDict()
@@ -976,6 +989,9 @@ class Trainer:
             iter_log[key] = to_log
         iter_log["iter"] = iteration
         iter_log["epoch"] = self.epoch
+        # Print per-scale curvature every save_every_x_iterations (default 1000, ~6 min) so the
+        # redundancy diagnostic is readable EARLY instead of after a full ~4.7h epoch.
+        self._log_scale_curvatures(iter_log, f"Epoch {self.epoch} iter {iteration}")
 
         if self.accelerator.is_main_process:
             self.wandb_run.log(iter_log)
