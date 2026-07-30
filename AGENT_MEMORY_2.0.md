@@ -748,3 +748,47 @@ targets. ⇒ the effect (if real) shows up in OPEN-LOOP. Open-loop is also the c
 - MPC (staged) is the expensive optional follow-up (~12h full) ONLY if open-loop shows a widening gap.
 
 ### 16.4 Status: commands issued to user; awaiting open-loop sweep results.
+
+## 17. Long-horizon boundary probe — FIRST on-hypothesis signal (open-loop, H=6/8)
+
+**Setup.** Open-loop GD, PushT, pure spatial cost (mode=last, alpha=1), **n_evals=50 kept via new
+`plan_chunk_size=10` chunking** (commit 4097eb7; each eval independent → identical to single batch,
+just memory-bounded — fixed the 45GB MIG OOM at long horizon). Multi-scale (`ms1-4_lam0.1-0.2_ep3`,
+in `checkpoints/`) vs iteration-matched single-scale baseline (`ms1-4_lam0.1-0_ep3`, in
+`checkpoints_baseline_matched/`). 3 data seeds 100/200/300. Both models, both horizons complete.
+
+### 17.1 Results (open-loop success %, mean±std over 3 data seeds)
+| H (goal_H) | Multi-scale (+L4) | Baseline (L1 only) | gap (multi−base) |
+|---|---|---|---|
+| 5 (25) | 76.67±6.43 | 74.67±6.43 | +2.00 (tie) |
+| 6 (30) | 56.67±5.77 (50/60/60) | 60.67±6.11 (66/62/54) | −4.00 (tie, within noise) |
+| 8 (40) | **32.00±2.00 (34/32/30)** | **22.67±2.31 (24/20/24)** | **+9.33 (bands DON'T overlap)** |
+
+### 17.2 Read
+- **H=8 is the first result that is both on-hypothesis AND outside data-seed noise:** multi-scale
+  degrades more gracefully at the horizon that stresses the model (multi [30,34] vs base [20,25],
+  no overlap). Pooled 2-prop z≈1.8, p≈0.07. Consistent with "coarse-scale straightening helps
+  long-horizon" (paper Thm-1 conditioning benefit compounds with horizon).
+- **H=5, H=6 are ties** → NOT a clean monotone trend; signal appears only at H=8.
+- **Collapse regime** (both <35% at H=8): the claim is *relative robustness / graceful
+  degradation*, a modest on-theory finding, not "multi-scale wins planning".
+
+### 17.3 Caveats (unchanged bottleneck)
+- Still **n=1 training run** each; the tight ±2 bands are data-seed only, do NOT capture training
+  variance. The +9.33 could be a lucky training draw.
+- Horizons H≥8 are past the model's reliable rollout range (num_pred=1) → both collapse; this
+  boundary (H=6–8) is the only place the coarse scale is active AND the model still half-works.
+- Pure spatial cost (no `L_agg`); paper's long-horizon used `L_spatial+0.1·L_agg` (not implemented).
+
+### 17.4 DECISIVE next step (now justified — there is a candidate signal)
+Retrain BOTH models with **2–3 training seeds** (`training.seed=0,1,2`), evaluate at **H=8**
+(+ H=5 control). If the +9 gap at H=8 holds across independent training runs → real finding:
+*multi-scale straightening improves long-horizon planning robustness*. If it washes out → single-run
+fluke, stop. (Optional: add `L_agg` long-horizon planning cost to lift both out of the collapse
+regime for a healthier-absolute comparison; but the training-seed test is the decider.)
+
+### 17.5 Tooling added
+- `plan_chunk_size` (conf/plan_gd.yaml null default; plan.py wires onto planner+sub_planner;
+  planning/gd.py `plan()` chunks then delegates to `_plan_batch()`). Commit 4097eb7, pushed.
+- Peak mem at H=8 with chunk=10, n_evals=50 ≈ 27GB/45GB (was OOM). NVML-assert fix remains
+  `PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync` on this DGX/MIG pod.
