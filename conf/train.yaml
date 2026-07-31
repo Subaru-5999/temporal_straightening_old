@@ -74,6 +74,13 @@ training:
   # iteration-match a baseline). Per-k errors are logged, giving the error-vs-k diagnostic free.
   rollout_steps: 1
   rollout_gamma: 0.9
+  # MEMORY LEVER for the rollout term. The K chained predict() calls have COMPOSED autograd
+  # graphs, so this term is memory-hungry (each call retains ~2GB of attention maps at batch 32).
+  # Computing it on a random sub-batch is an UNBIASED estimate of the full-batch mean (same
+  # expectation, slightly noisier gradient) and cuts its memory proportionally.
+  # 1.0 = whole batch. Try 0.5 if you OOM. Also consider has_decoder=false, which is FREE:
+  # the decoder is detached/inert (verified: decoder ON and OFF gave identical eval results).
+  rollout_batch_frac: 1.0
   decoder_start_epoch: 1  # start optimizing decoder at this epoch
   reconstruct_every_x_batch: 1000
   num_reconstruct_samples: 5

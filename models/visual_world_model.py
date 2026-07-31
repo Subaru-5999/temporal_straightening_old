@@ -38,6 +38,7 @@ class VWorldModel(nn.Module):
         straighten_lambdas=None,
         rollout_steps=1,
         rollout_gamma=0.9,
+        rollout_batch_frac=1.0,
         **kwargs,
     ):
         super().__init__()
@@ -127,6 +128,16 @@ class VWorldModel(nn.Module):
         self.rollout_gamma = float(rollout_gamma)
         # Minimum window: k-step targets need real frames up to index num_hist + K - 1.
         self.rollout_min_frames = self.num_hist + self.rollout_steps
+        # MEMORY LEVER. The K chained predict() calls have COMPOSED autograd graphs (step k's
+        # graph contains steps 1..k-1), and each call retains ~(b, heads, T*p, T*p) attention
+        # maps per layer. Computing the rollout term on a random SUB-BATCH is an unbiased
+        # estimate of the full-batch mean (same expectation, slightly noisier), and cuts this
+        # term's memory proportionally. 1.0 = use the whole batch (default).
+        self.rollout_batch_frac = float(rollout_batch_frac)
+        if not (0.0 < self.rollout_batch_frac <= 1.0):
+            raise ValueError(
+                f"rollout_batch_frac must be in (0, 1], got {self.rollout_batch_frac}"
+            )
 
         # Effective ABSOLUTE lambda per scale (= straighten_scale * weight); for logging/inspection.
         self.straighten_effective_lambdas = [
@@ -427,6 +438,16 @@ class VWorldModel(nn.Module):
         logs = {}
         if max_k < 1:
             return None, logs
+
+        # Optional sub-batch for memory (unbiased: a random subset's mean estimates the
+        # full-batch mean). Must subsample z and act TOGETHER to keep frames/actions aligned.
+        if self.rollout_batch_frac < 1.0:
+            b_full = z.shape[0]
+            b_sub = max(1, int(round(b_full * self.rollout_batch_frac)))
+            if b_sub < b_full:
+                idx = torch.randperm(b_full, device=z.device)[:b_sub]
+                z = z[idx]
+                act = act[idx]
 
         hist = z[:, :nh]                       # real frames 0 .. nh-1 (teacher-forced start)
         total = None
