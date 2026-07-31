@@ -74,8 +74,16 @@ training:
   # iteration-match a baseline). Per-k errors are logged, giving the error-vs-k diagnostic free.
   rollout_steps: 1
   rollout_gamma: 0.9
-  # MEMORY LEVER for the rollout term. The K chained predict() calls have COMPOSED autograd
-  # graphs, so this term is memory-hungry (each call retains ~2GB of attention maps at batch 32).
+  # MEMORY LEVER 1 (default ON, use this first). Activation checkpointing on the rollout's
+  # predict() calls. Each call otherwise retains, per ViT layer, the attention scores AND their
+  # softmax -- shape (batch, heads, num_hist*num_patches, num_hist*num_patches) = (32,16,588,588)
+  # ~= 708 MB each in fp32, x2 tensors x depth 6 ~= 8.5 GB PER predict(). K=4 therefore needs
+  # ~34 GB on top of the base forward and OOMs a 45 GB MIG slice. Checkpointing stores only each
+  # step's input/output and recomputes the interior during backward: peak drops to ~one
+  # predict(), cost ~+30% step time, gradients IDENTICAL (RNG + autocast state are preserved).
+  rollout_checkpoint: true
+  # MEMORY LEVER 2 (only if lever 1 is not enough). The K chained predict() calls have COMPOSED
+  # autograd graphs, so this term is memory-hungry even with checkpointing.
   # Computing it on a random sub-batch is an UNBIASED estimate of the full-batch mean (same
   # expectation, slightly noisier gradient) and cuts its memory proportionally.
   # 1.0 = whole batch. Try 0.5 if you OOM. Also consider has_decoder=false, which is FREE:

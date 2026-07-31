@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as ckpt
 import logging
 from torchvision import transforms
 from einops import rearrange, repeat
@@ -39,6 +40,7 @@ class VWorldModel(nn.Module):
         rollout_steps=1,
         rollout_gamma=0.9,
         rollout_batch_frac=1.0,
+        rollout_checkpoint=True,
         **kwargs,
     ):
         super().__init__()
@@ -138,6 +140,27 @@ class VWorldModel(nn.Module):
             raise ValueError(
                 f"rollout_batch_frac must be in (0, 1], got {self.rollout_batch_frac}"
             )
+        # PRIMARY memory lever: gradient (activation) checkpointing on the rollout's predict()
+        # calls. Without it each call retains, per ViT layer, the (b, heads, num_hist*p,
+        # num_hist*p) attention score tensor AND its softmax output -- for depth=6, heads=16,
+        # b=32, num_hist*p=3*196=588 that is ~8.5 GB per predict() in fp32, so K=4 extra calls
+        # alone need ~34 GB and OOM a 45 GB MIG slice. With checkpointing each rollout step
+        # stores only its input/output and RECOMPUTES the interior during backward, so peak
+        # memory is ~one predict() instead of K, at roughly +30% step time. Mathematically a
+        # no-op: identical gradients (PyTorch preserves RNG + autocast state).
+        self.rollout_checkpoint = bool(rollout_checkpoint)
+        if self.rollout_steps > 1:
+            log.info(
+                "Multi-step rollout consistency ENABLED: K=%s gamma=%s batch_frac=%s "
+                "grad_checkpoint=%s (needs window>=%s frames)",
+                self.rollout_steps,
+                self.rollout_gamma,
+                self.rollout_batch_frac,
+                self.rollout_checkpoint,
+                self.rollout_min_frames,
+            )
+        else:
+            log.info("Multi-step rollout consistency disabled (K=1, paper-exact)")
 
         # Effective ABSOLUTE lambda per scale (= straighten_scale * weight); for logging/inspection.
         self.straighten_effective_lambdas = [
@@ -418,7 +441,18 @@ class VWorldModel(nn.Module):
         act_rep = act_tiled.repeat(1, 1, 1, self.num_action_repeat)          # (b,1,p,action_dim)
         return torch.cat([z_frame[..., : -self.action_dim], act_rep], dim=-1)
 
-    def rollout_consistency_loss(self, z, act):
+    def _predict_maybe_ckpt(self, hist):
+        """`predict(hist)` with optional activation checkpointing (training + grad only).
+
+        Same output and same gradients as `self.predict(hist)`; trades ~30% extra compute for
+        an O(K) -> O(1) reduction in retained attention activations. Disabled automatically
+        when grad is off (eval/val), where there is nothing to retain anyway.
+        """
+        if self.rollout_checkpoint and self.training and torch.is_grad_enabled():
+            return ckpt.checkpoint(self.predict, hist, use_reentrant=False)
+        return self.predict(hist)
+
+    def rollout_consistency_loss(self, z, act, z_pred_first=None):
         """Multi-step rollout-consistency loss.
 
         Mirrors the PLANNING-time procedure (`rollout`): start from the real history
@@ -427,6 +461,10 @@ class VWorldModel(nn.Module):
 
         k=1 is ALREADY covered by the standard one-step `z_loss` in forward(), so only
         k>=2 contribute to the loss; k=1 is still measured and returned for diagnostics.
+
+        `z_pred_first` is the base forward's `predict(z[:, :num_hist])`. The rollout's k=1 step
+        has EXACTLY that input, so passing it in removes one fully duplicated predictor call
+        (compute + memory) with no change to the result.
 
         Returns (loss_or_None, logs) where logs holds per-k errors (detached) so the
         error-vs-k curve -- i.e. whether error is amplified -- is directly observable.
@@ -440,7 +478,8 @@ class VWorldModel(nn.Module):
             return None, logs
 
         # Optional sub-batch for memory (unbiased: a random subset's mean estimates the
-        # full-batch mean). Must subsample z and act TOGETHER to keep frames/actions aligned.
+        # full-batch mean). Must subsample z, act AND the reused z_pred_first TOGETHER so
+        # frames, actions and the cached k=1 prediction stay row-aligned.
         if self.rollout_batch_frac < 1.0:
             b_full = z.shape[0]
             b_sub = max(1, int(round(b_full * self.rollout_batch_frac)))
@@ -448,11 +487,16 @@ class VWorldModel(nn.Module):
                 idx = torch.randperm(b_full, device=z.device)[:b_sub]
                 z = z[idx]
                 act = act[idx]
+                if z_pred_first is not None:
+                    z_pred_first = z_pred_first[idx]
 
         hist = z[:, :nh]                       # real frames 0 .. nh-1 (teacher-forced start)
         total = None
         for k in range(1, max_k + 1):
-            pred = self.predict(hist)          # (b, nh, p, d)
+            if k == 1 and z_pred_first is not None:
+                pred = z_pred_first            # reuse the base forward's identical call
+            else:
+                pred = self._predict_maybe_ckpt(hist)   # (b, nh, p, d)
             z_next = pred[:, -1:, ...]         # prediction of frame index j
             j = nh + k - 1                     # absolute index of the predicted frame
 
@@ -614,7 +658,11 @@ class VWorldModel(nn.Module):
             # Always computed when rollout_steps>1 so the per-k error curve is logged even if
             # the added loss is None (e.g. window too short); k=1 error is diagnostic only.
             if self.rollout_steps > 1:
-                roll_loss, roll_logs = self.rollout_consistency_loss(z, act)
+                # Hand over the already-computed one-step prediction: the rollout's k=1 step
+                # has the identical input z[:, :num_hist], so this skips a duplicate call.
+                roll_loss, roll_logs = self.rollout_consistency_loss(
+                    z, act, z_pred_first=z_pred
+                )
                 for _k, _v in roll_logs.items():
                     loss_components[_k] = _v
                 if roll_loss is not None:

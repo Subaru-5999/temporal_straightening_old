@@ -925,3 +925,111 @@ tie/harm should disappear. Cost: ~14h train + ~1.5h eval, still n=1.
 The ~10-line per-scale logging diagnostic (commit 5fbc03c) **overturned a mechanistic story that had
 been asserted confidently across several turns.** Measure the intermediate quantity before building an
 explanation on it. Where a hypothesis is cheap to instrument, instrument it FIRST.
+
+---
+
+## 20. NEW DIRECTION — multi-step rollout-consistency loss (exposure bias), K>1
+
+Replaces multi-scale as the active research route. Multi-scale is CLOSED (§18/§19).
+
+### 20.1 The diagnosis (grounded in code, not memory)
+- `conf/train.yaml`: `num_pred: 1`. `forward()` computes `z_pred = self.predict(z[:, :num_hist])`
+  and compares against `z[:, num_pred : num_pred+num_hist]`. **Every predictor input at training
+  time is a REAL encoded frame** (teacher forcing).
+- At planning time `rollout()` feeds the predictor **its own output** for H steps.
+- Gap = **exposure bias**. Error recursion `e_{k+1} ~= L*e_k + eps` gives
+  `e_k ~= eps*(L^k - 1)/(L - 1)`: geometric blow-up whenever the effective gain `L > 1`.
+  The one-step loss never sees a composed prediction, so it puts **no pressure on L**.
+- Consistent with our own measurements: open-loop success 77 -> 57 -> 32 -> 12 at H = 5, 6, 8, 10.
+
+### 20.2 Why it is NOT redundant with straightening (the strong argument)
+Cosine curvature `1 - cos(v_t, v_{t+1})` is **scale-invariant**: multiply every velocity by 10 and
+the loss is unchanged. Straightening therefore constrains the **direction** of latent motion and
+**never the gain**. The rollout loss constrains exactly the gain. Provably complementary — they
+cannot substitute for one another. (Contrast with multi-scale, whose terms were the same *kind* of
+quantity at different strides, which is where redundancy worries came from.)
+
+### 20.3 The loss (implemented)
+```
+L_roll = sum_{k=2..K} gamma^(k-1) * || rollout_k(z_0..z_{nh-1}) - sg(z_{nh+k-1}) ||^2
+```
+- k = 1 is **deliberately excluded** from the loss: it is already exactly `z_loss`. It is still
+  measured and logged, giving the error-vs-k curve for free.
+- Real actions are injected into each predicted frame (`_inject_action`, built with `torch.cat`,
+  non-in-place -> autograd-safe; the eval-time `replace_actions_from_z` is in-place and unusable here).
+- Targets use `sg` (`stop_grad=True`), matching the paper's convention.
+- `K=1` -> returns `None` -> **bit-identical to the paper**.
+
+### 20.4 Knobs (`conf/train.yaml`, `training.*`)
+| knob | default | meaning |
+|---|---|---|
+| `rollout_steps` (K) | `1` | chain length; 1 = paper-exact no-op |
+| `rollout_gamma` | `0.9` | discount `gamma^(k-1)`, down-weights far steps |
+| `rollout_checkpoint` | `true` | activation checkpointing on rollout `predict()` calls |
+| `rollout_batch_frac` | `1.0` | compute the term on a random sub-batch (unbiased) |
+
+Folder tag `_roll<K>g<gamma>` via `rollout_tag` in `custom_resolvers.py`; empty at K=1 and stripped
+by the `base_cell` regex in `reproduce_table1.py` / `summarize_run.py`.
+
+### 20.5 THE OOM AND ITS FIX (two crashes, root cause computed then fixed)
+Both crashes landed on `models/vit.py:75  attn = self.attend(dots)` — the softmax.
+
+Arithmetic (`conf/predictor/vit.yaml`: `depth: 6`, `heads: 16`, `dropout: 0.1`):
+- sequence length `n = num_hist * num_patches = 3 * 196 = 588`
+- `dots` shape `(32, 16, 588, 588)` ~= **177 M elements**; accelerate's `convert_to_fp32` wrapper
+  means ~**708 MB** per tensor
+- `dots` **and** its softmax output are both retained, x depth 6 => ~**8.5 GB per `predict()` call**
+- base forward = 1 call; K=4 rollout added 4 more => ~42 GB on a **45 GB MIG slice** => OOM.
+
+`has_decoder=false` did NOT help, and that is expected: the decoder is fed `z.detach()`, so it is
+inert — decoder ON vs OFF gave identical eval results. It was never the memory driver.
+
+**Fix (this session):**
+1. **`_predict_maybe_ckpt()`** — wraps `self.predict` in
+   `torch.utils.checkpoint.checkpoint(..., use_reentrant=False)` when `training and
+   torch.is_grad_enabled()`. Stores only each step's input/output and recomputes the interior on
+   backward: peak goes from O(K) predicts to ~O(1) (~17 GB), cost ~+30% step time.
+2. **`z_pred_first` reuse** — the rollout's k=1 input `z[:, :num_hist]` is *identical* to the base
+   forward's. `forward()` now passes its `z_pred` in, deleting one full duplicated predictor call
+   (compute and memory). Subsampled with the same `idx` when `rollout_batch_frac < 1.0` so rows
+   stay aligned.
+
+**Verified locally** (throwaway script, real `VWorldModel` methods bound to a stub predictor
+*with dropout 0.1*, since deleted):
+- loss identical across no-ckpt / ckpt / ckpt+reuse: `2.4648642539978027` in all three
+- **max |grad diff| = exactly 0.0** for both changes (non-reentrant checkpoint preserves RNG so the
+  dropout masks match on recompute)
+- loss == `sum_{k>=2} gamma^(k-1) * err_k` (k=1 excluded, as intended)
+- `rollout_batch_frac=0.5`, the no-grad/eval path, and `K=1 -> None` all behave correctly
+
+Escalation ladder if it still OOMs: `rollout_batch_frac=0.5`, then `rollout_steps=3`, then `2`.
+
+### 20.6 Iteration arithmetic (window widening)
+`train.py` widens the dataset window to `num_hist + K` frames. Confirmed on the pod: K=4 -> 7-frame
+window -> log showed **53,171** iters/epoch, matching the prediction
+`61,929 - 15 * 18,685/32 = 53,170.4 -> 53,171` exactly.
+- 3 epochs at the widened window = **159,513** steps.
+- To iteration-match the existing baseline, pass `training.max_train_steps=141996`
+  (baseline `MSE + 0.1*L1`, 3 data seeds, 50 tasks: **74.67 +/- 6.43 OL / 88.67 +/- 6.11 MPC**).
+
+### 20.7 Run command (own checkpoint root, per the "don't mix up" rule)
+```bash
+cd /workspace/arun/temporal_straightening_old && git pull
+unset CUDA_VISIBLE_DEVICES
+export DATASET_DIR=/workspace/arun/data WANDB_MODE=disabled WANDB_SILENT=true
+export PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 NUMEXPR_NUM_THREADS=8
+setsid nohup python train.py --config-name train.yaml env=pusht encoder=dino_channel \
+  training.straighten=aggcos1e-1 training.encoder_lr=1e-5 training.epochs=3 env.num_workers=4 \
+  training.rollout_steps=4 training.rollout_gamma=0.9 training.rollout_checkpoint=true \
+  training.max_train_steps=141996 has_decoder=false \
+  ckpt_base_path=$PWD/checkpoints_rollout > train_rollout_k4_ep3.log 2>&1 < /dev/null &
+```
+Early diagnostic (~10 min in):
+`grep -a "rollout error vs k" train_rollout_k4_ep3.log | tail -3` — expect k1 < k2 < k3 < k4 rising
+steeply at the start of training and **flattening** as the term takes effect. A flat-from-the-start
+curve would mean the compounding premise is wrong for this model, which would kill the hypothesis.
+
+### 20.8 Status
+Code complete and locally verified; **awaiting the pod run**. Nothing empirical yet — do not claim
+any success rate for this route until the eval table exists.

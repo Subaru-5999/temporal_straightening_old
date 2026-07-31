@@ -467,6 +467,7 @@ class Trainer:
             rollout_steps=self.cfg.training.get("rollout_steps", 1),
             rollout_gamma=self.cfg.training.get("rollout_gamma", 0.9),
             rollout_batch_frac=self.cfg.training.get("rollout_batch_frac", 1.0),
+            rollout_checkpoint=self.cfg.training.get("rollout_checkpoint", True),
         )
         self._log_trainable_params(self.model, "model")
 
