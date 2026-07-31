@@ -859,3 +859,69 @@ regularizers can make latent-dynamics training harder for long rollouts. Full wr
 `00_TUTOR_SYSTEM_PROMPT.md`, `01_WORLD_MODELS.md`, `02_TEMPORAL_STRAIGHTENING.md`,
 `03_PROJECT_LATEST_MATH_AND_CODE.md`, `04_ARCHITECTURE_DIAGRAMS.md`, `05_REFERENCES_VERIFIED.md`
 (refs tagged [BIB]/[TEX]/[CODE]/[WEB]), plus bundled `paper_source/` LaTeX as ground truth.
+
+## 19. CORRECTION — the REDUNDANCY hypothesis is EMPIRICALLY REFUTED (supersedes §18.4)
+
+**Measured per-scale curvature** (4-scale run `ms1-2-3-4_lam0.1-0.1-0.075-0.05_ep3`, end of epoch 3,
+from the logging added in commit 5fbc03c):
+
+| scale | train L_curv^(s) | val L_curv^(s) | train ratio to s=1 |
+|---|---|---|---|
+| s=1 | 0.200932 | 0.335766 | 1.00x |
+| s=2 | 0.202086 | 0.386792 | 1.01x |
+| s=3 | 0.255287 | 0.494453 | **1.27x** |
+| s=4 | 0.321961 | 0.597842 | **1.60x** (val 1.78x) |
+
+**⇒ Coarse curvature is NOT ~0. It is MONOTONICALLY LARGER than fine curvature, on both train and
+val.** The §18.4 / §3 prediction (`L_curv^(s) ≈ 0` for s>1 once s=1 is minimized) is **FALSE**.
+**RETRACT the telescoping-redundancy explanation for the multi-scale null.**
+
+In angles: cos = 1 − L, so 1-step velocities still turn ~37 deg (arccos 0.799) and 4-step block
+velocities ~47 deg (arccos 0.678). The latent path stays substantially bent at EVERY scale.
+
+### 19.1 Why the telescoping argument failed (keep this reasoning)
+The identity `v_t^(s) = v_t + ... + v_{t+s-1}` is correct. The bad inference was "consecutive
+velocities aligned ⇒ block sums aligned." That needs NEAR-PERFECT alignment; with a residual ~37 deg
+turn per step, small turns **accumulate** across a block.
+**Killer counterexample: a CIRCLE.** Every small arc looks nearly straight (small fine curvature) yet
+a quarter circle rotates direction by 90 deg (large coarse curvature). Locally straight does NOT imply
+globally straight. PushT (contact + T-block rotation) is exactly such a gently-but-persistently
+curving regime. ⇒ **coarse scales DO carry independent information.**
+
+### 19.2 The reopened question: if not redundant, why did the extra terms HURT (-6.00 OL / -6.00 MPC)?
+Three candidates; with n=1 training run per config they CANNOT be separated:
+1. **(Leading) The coarse curvature is genuine, irreducible structure.** If PushT trajectories really
+   curve over 8 steps, forcing them straight fights the true dynamics -> capacity spent on a
+   geometrically wrong constraint -> prediction degrades -> planning degrades. Echoes the paper's
+   App. finding that over-strong smoothness / temporal-contrastive terms hurt.
+2. **Over-regularization, WORSE than previously estimated.** The earlier claim "redundant terms sit
+   near floor so gradients are small, so risk is modest" is ALSO retracted — the terms are at
+   0.20-0.32 and exert REAL pressure. Total lambda 0.325 = 3.25x paper of genuinely-active pressure
+   starves L_pred.
+   COUNTER-EVIDENCE: the s=4-only run had total lambda 0.3 (nearly the same) yet TIED instead of
+   dropping 6 pts -> total lambda alone does not explain the difference between the two runs.
+3. **Unmeasured training-run variance.** Neither drop is individually significant (z=1.15 OL,
+   z=1.48 MPC). Training variance is unestimated (n=1, bf16, no determinism flags) — a live candidate.
+
+### 19.3 Net status after the correction
+- **STANDS:** multi-scale does not help empirically (2 configs at matched 141,996 steps: one tie, one
+  6 pts worse). The route remains CLOSED per the user's exit criterion.
+- **NEW POSITIVE FINDING (measured, novel):** latent curvature **increases with temporal scale**, and
+  fine-scale straightening does **not** remove coarse-scale curvature (train 0.20 -> 0.32; val
+  0.34 -> 0.60). This is a genuine quantitative statement about the learned geometry and is the
+  OPPOSITE of the redundancy prediction. Worth reporting in any writeup.
+- **RETRACTED:** redundancy/telescoping as the mechanism (§18.4, and §3 of
+  `STUDY_PACKAGE/03_PROJECT_LATEST_MATH_AND_CODE.md` — both need correcting).
+- **OPEN:** the true mechanism for the harm.
+
+### 19.4 Optional follow-up (NOT recommended without appetite; user exit criterion already met)
+Because harm may be over-regularization rather than redundancy, a gentle multi-scale run keeping the
+PAPER's total pressure (e.g. lambdas summing to ~0.1, say [0.05,0.025,0.015,0.01]) is the one
+untested variant that could distinguish hypothesis 1 from 2. If coarse curvature is irreducible
+structure (h1), gentle pressure still shouldn't help; if it was pure over-regularization (h2), the
+tie/harm should disappear. Cost: ~14h train + ~1.5h eval, still n=1.
+
+### 19.5 Lesson for the loop
+The ~10-line per-scale logging diagnostic (commit 5fbc03c) **overturned a mechanistic story that had
+been asserted confidently across several turns.** Measure the intermediate quantity before building an
+explanation on it. Where a hypothesis is cheap to instrument, instrument it FIRST.
