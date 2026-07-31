@@ -792,3 +792,70 @@ regime for a healthier-absolute comparison; but the training-seed test is the de
   planning/gd.py `plan()` chunks then delegates to `_plan_batch()`). Commit 4097eb7, pushed.
 - Peak mem at H=8 with chunk=10, n_evals=50 ≈ 27GB/45GB (was OOM). NVML-assert fix remains
   `PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync` on this DGX/MIG pod.
+
+## 18. MULTI-SCALE CLOSED — dense 4-scale variant is WORSE (exit criterion met)
+
+**Run:** `pusht_..._ms1-2-3-4_lam0.1-0.1-0.075-0.05_ep3` (own root `checkpoints_ms_4scale`).
+scales=[1,2,3,4], lambdas=[0.1,0.1,0.075,0.05]; max scale 4 -> 9-frame window -> 47,332 iters/epoch
+x 3 = **141,996 steps**, i.e. iteration-matched to §15/§17 runs. Eval: OL+MPC, H=5, 3 data seeds, 50 tasks.
+
+### 18.1 Results at matched 141,996 steps (PushT ✓)
+| Run | Loss | Open-loop | MPC |
+|---|---|---|---|
+| Baseline (paper loss) | MSE+0.1·L1 | **74.67±6.43** (72,82,70) | **88.67±6.11** (94,82,90) |
+| s=4 multi-scale | +0.2·L4 | 76.67±6.43 (72,84,74) | 88.00±3.46 |
+| **4-scale (new)** | +0.1·L2+0.075·L3+0.05·L4 | **68.67±7.02** (76,68,62) | **82.67±6.43** (90,80,78) |
+
+Deltas of 4-scale: **vs baseline −6.00 OL / −6.00 MPC**; vs s=4 run −8.00 OL / −5.33 MPC.
+→ **the dense 4-scale variant is the WORST configuration tested.**
+
+### 18.2 Why this is more informative than the earlier ties (SIGN CONSISTENCY)
+- s=4 run: +2.00 OL, −0.67 MPC → signs DISAGREE → noise scatter about zero (a tie).
+- 4-scale run: −6.00 OL, −6.00 MPC → **both negative, equal magnitude** → directional evidence of
+  mild real HARM. Individually z=1.15 (OL, p≈0.25) and z=1.48 (MPC, p≈0.14) — not individually
+  significant, but sign-consistency across two metrics on the same model is hard to get from noise.
+
+### 18.3 Two hypotheses REFUTED, one prediction CONFIRMED
+- **CONFIRMED (over-regularization):** total λ = 0.1+0.1+0.075+0.05 = **0.325 = 3.25× the paper's
+  validated 0.1**. Paper's App. ablation (smoothness/temporal-contrastive) states larger weights on
+  temporal regularizers HURT. Exactly what happened — extra curvature pressure starves L_pred.
+- **REFUTED (scale/horizon mismatch):** user's hypothesis was that s=4 failed because its 8-step
+  reach overshoots H=5, and adding s=2 (4-step reach, INSIDE H=5, 5 triplets/window) would fix MPC.
+  s=2 was included and MPC went DOWN 6 points. Horizon-matching did not rescue it.
+- **REFUTED ("more scales = better global straightening"):** 2 scales → 4 scales made it worse.
+  Consistent with telescoping redundancy (§ below): correlated constraints, no new information,
+  plus added pressure and gradient noise.
+
+### 18.4 The mechanism (canonical explanation for the whole null)
+Telescoping identity (exact algebra): `v_t^(s) = v_t + v_{t+1} + ... + v_{t+s-1}`. The s=1 term already
+aligns consecutive fine velocities; aligned vectors have aligned partial sums, so `L_curv^(s) ≈ 0`
+for s>1 BEFORE λ_s acts. Coarse scales are **spanned by** the fine scale → little independent
+gradient. Cross-check with paper Thm 1: the fine scale alone drives ε=||A−I||→0, so coarse terms
+don't lower ε further → same conditioning → same success. Theory, algebra, and measurement agree.
+
+### 18.5 STATUS: MULTI-SCALE ROUTE CLOSED (user's pre-committed exit criterion)
+User's note: "If we don't see any improvement, we will completely abandon the multiscale route and
+move to something more concrete and sensible." Scoreboard at matched compute: best case a TIE
+(s=[1,4]), worst case mild HARM (s=[1,2,3,4]). ⇒ **Closed.** Outcome = a rigorous negative result
+WITH a mechanism, which is a legitimate contribution (not a wasted effort).
+
+Pending (optional, cheap) mechanistic confirmation: `grep -a "per-scale curvature" train_ms_s1234_ep3.log`
+— if curv_s2/s3/s4 ≈ 0 while curv_s1 > 0, redundancy is confirmed empirically, not just algebraically.
+
+### 18.6 NEXT DIRECTION (design rule derived from the failure)
+A new term must attack a factor of the conditioning bound that straightening does NOT already
+control, else it is redundant by construction. From Thm 1:
+`kappa_eff(H) <= kappa(B)^2 · ((1+ε)/(1−ε))^(2(H−1))` — straightening only touches ε; **`kappa(B)^2`
+(action→latent map conditioning) is UNTOUCHED and horizon-INDEPENDENT**, so improving it can help even
+at H=5 where multi-scale had no room. Proposal (untested): action-isometry regularizer
+`L_iso = ||J_a^T J_a − cI||_F^2`, `J_a = d(z_{t+1}−z_t)/da_t`, with a cheap 2-perturbation estimator
+(no explicit Jacobian). Grounding: Isometric Autoencoders (arXiv 2006.09289), Kato et al.
+(1910.04329), dynamical isometry (1711.04735). CAUTION cite: arXiv 2603.03238 reports geometry
+regularizers can make latent-dynamics training harder for long rollouts. Full write-up:
+`STUDY_PACKAGE/03_PROJECT_LATEST_MATH_AND_CODE.md` §8.
+
+### 18.7 Deliverable created this session
+`STUDY_PACKAGE/` (+ `STUDY_PACKAGE.zip`, 76KB): hallucination-guarded LLM tutor kit —
+`00_TUTOR_SYSTEM_PROMPT.md`, `01_WORLD_MODELS.md`, `02_TEMPORAL_STRAIGHTENING.md`,
+`03_PROJECT_LATEST_MATH_AND_CODE.md`, `04_ARCHITECTURE_DIAGRAMS.md`, `05_REFERENCES_VERIFIED.md`
+(refs tagged [BIB]/[TEX]/[CODE]/[WEB]), plus bundled `paper_source/` LaTeX as ground truth.
