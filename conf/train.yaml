@@ -15,9 +15,9 @@ ckpt_base_path: ./checkpoints
 
 hydra:
   run:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${run_variant_tag:${training.epochs},${training.seed}}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${rollout_tag:${training.rollout_steps},${training.rollout_gamma}}${run_variant_tag:${training.epochs},${training.seed}}
   sweep:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${run_variant_tag:${training.epochs},${training.seed}}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${rollout_tag:${training.rollout_steps},${training.rollout_gamma}}${run_variant_tag:${training.epochs},${training.seed}}
     subdir: ${hydra.job.num}
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
@@ -60,6 +60,20 @@ training:
   #     (aggcos1e-1 -> 0.1); effective coefficient = 0.1 * w_s. null = all 1.0.
   straighten_scale_weights: null
   straighten_goal_weight: 0.0      # mu>0 adds the directional term (pseudo-goal = window's last frame)
+  # ---- Multi-step rollout-consistency loss (NOVEL extension; 1 = paper exactly) ------------
+  # WHY: the predictor is TRAINED one step ahead with teacher forcing (every input is a real
+  # encoded frame) but USED autoregressively for H steps at planning time, consuming its own
+  # output. Error then compounds as e_{k+1} ~ L*e_k + eps, and the one-step loss puts NO
+  # pressure on the amplification factor L. This term adds
+  #     sum_{k=2..K} rollout_gamma^(k-1) * || rollout_k(z) - sg(z_{num_hist+k-1}) ||^2
+  # so gradients flow through the composition f(f(...)) and the model is penalised for
+  # amplifying its own error. Complementary to straightening: cosine curvature is
+  # scale-invariant so it constrains DIRECTION only, never the gain L.
+  # rollout_steps=1 adds nothing -> bit-identical to the paper. K>1 widens the training window
+  # to num_hist+K frames (which lowers iterations/epoch -> use training.max_train_steps to
+  # iteration-match a baseline). Per-k errors are logged, giving the error-vs-k diagnostic free.
+  rollout_steps: 1
+  rollout_gamma: 0.9
   decoder_start_epoch: 1  # start optimizing decoder at this epoch
   reconstruct_every_x_batch: 1000
   num_reconstruct_samples: 5

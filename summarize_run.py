@@ -28,9 +28,12 @@ RESULTS_DIR = "results"
 
 def base_cell(name):
     """Strip trailing setting/variant tags so every setting variant shares its base cell's
-    paper target: _ms<scales>, _lam<...>, _w<...>, _ep<N>, _seed<N> (any order/combination).
+    paper target: _ms<scales>, _lam<...>, _w<...>, _roll<K>g<G>, _ep<N>, _seed<N>
+    (any order/combination).
     'pusht_..._lr1e-05_ms1-4_lam0.1-0.2_ep3' -> 'pusht_..._lr1e-05'."""
-    pat = re.compile(r"_(?:ms[0-9-]+|lam[0-9.\-]+|w[0-9.\-]+|ep\d+|seed\d+)$")
+    pat = re.compile(
+        r"_(?:ms[0-9-]+|lam[0-9.\-]+|w[0-9.\-]+|roll\d+g[0-9.]+|ep\d+|seed\d+)$"
+    )
     prev = None
     while prev != name:
         prev = name

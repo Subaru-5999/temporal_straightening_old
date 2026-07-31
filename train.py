@@ -158,16 +158,32 @@ class Trainer:
                 _coeffs = list(_weights) if _weights is not None else [1.0] * len(_scales)
             _active = [int(s) for s, c in zip(_scales, _coeffs) if float(c) > 0]
             if _active:
-                _needed = 2 * max(_active) + 1
+                _straighten_needed = 2 * max(_active) + 1
                 _base = self.cfg.num_hist + self.cfg.num_pred
-                if _needed > _base:
-                    _dataset_kwargs["num_frames"] = _needed
+                if _straighten_needed > _base:
+                    _dataset_kwargs["num_frames"] = _straighten_needed
                     log.info(
                         "Multi-scale straightening: dataset window num_frames=%s "
                         "(base num_hist+num_pred=%s) for ACTIVE scales=%s (lambda>0); needs "
                         "trajectories >= %s env-steps (num_frames*frameskip).",
-                        _needed, _base, _active, _needed * self.cfg.frameskip,
+                        _straighten_needed, _base, _active, _straighten_needed * self.cfg.frameskip,
                     )
+        # Multi-step rollout-consistency loss also needs a longer window: the k-step target is
+        # the real latent at index num_hist+K-1, so the window must hold num_hist+K frames.
+        # Applied independently of straightening (the rollout loss works with or without it).
+        _K = self.cfg.training.get("rollout_steps", 1)
+        _K = int(_K) if _K else 1
+        if _K > 1:
+            _base = self.cfg.num_hist + self.cfg.num_pred
+            _roll_needed = self.cfg.num_hist + _K
+            _cur = _dataset_kwargs.get("num_frames", _base)
+            if _roll_needed > _cur:
+                _dataset_kwargs["num_frames"] = _roll_needed
+                log.info(
+                    "Multi-step rollout loss (rollout_steps=%s): dataset window num_frames=%s "
+                    "(was %s); needs trajectories >= %s env-steps.",
+                    _K, _roll_needed, _cur, _roll_needed * self.cfg.frameskip,
+                )
         self.datasets, traj_dsets = hydra.utils.call(
             self.cfg.env.dataset,
             **_dataset_kwargs,
@@ -448,6 +464,8 @@ class Trainer:
             straighten_scale_weights=self.cfg.training.get("straighten_scale_weights", None),
             straighten_goal_weight=self.cfg.training.get("straighten_goal_weight", 0.0),
             straighten_lambdas=self.cfg.training.get("straighten_lambdas", None),
+            rollout_steps=self.cfg.training.get("rollout_steps", 1),
+            rollout_gamma=self.cfg.training.get("rollout_gamma", 0.9),
         )
         self._log_trainable_params(self.model, "model")
 
@@ -970,15 +988,26 @@ class Trainer:
         self.epoch_log = OrderedDict()
 
     def _log_scale_curvatures(self, log_dct, prefix):
-        """Print per-scale raw curvature L_curv^(s) to the LOG FILE. These otherwise only go
-        to wandb, which is disabled for headless runs -- so without this the multi-scale
-        redundancy diagnostic would be invisible. Purely informational."""
+        """Print per-scale raw curvature L_curv^(s) AND per-step rollout error to the LOG FILE.
+        These otherwise only go to wandb, which is disabled for headless runs -- so without this
+        the multi-scale redundancy diagnostic and the rollout error-vs-k curve would both be
+        invisible. Purely informational."""
         curv = {k: v for k, v in log_dct.items() if "curv_s" in k}
         if curv:
             log.info(
                 "%s per-scale curvature: %s",
                 prefix,
                 "  ".join(f"{k}={v:.6f}" for k, v in sorted(curv.items())),
+            )
+        # Sort by k numerically (k10 must not sort before k2) so the growth curve reads in order.
+        roll = {k: v for k, v in log_dct.items() if "rollout_err_k" in k}
+        if roll:
+            def _kidx(key):
+                return int(key.split("rollout_err_k")[-1])
+            log.info(
+                "%s rollout error vs k: %s",
+                prefix,
+                "  ".join(f"{k}={roll[k]:.6f}" for k in sorted(roll, key=_kidx)),
             )
 
     def logs_flash_iter(self, iteration):

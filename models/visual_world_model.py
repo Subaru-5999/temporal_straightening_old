@@ -36,6 +36,8 @@ class VWorldModel(nn.Module):
         straighten_scale_weights=None,
         straighten_goal_weight=0.0,
         straighten_lambdas=None,
+        rollout_steps=1,
+        rollout_gamma=0.9,
         **kwargs,
     ):
         super().__init__()
@@ -112,6 +114,19 @@ class VWorldModel(nn.Module):
 
         # weight mu of the optional directional (goal-aligned) term; 0 = disabled
         self.straighten_goal_weight = float(straighten_goal_weight)
+
+        # ---- Multi-step rollout-consistency loss (NOVEL; rollout_steps=1 == paper exactly) ----
+        # The predictor is TRAINED one step ahead (teacher forcing: every input is a real encoded
+        # frame) but USED autoregressively for H steps at planning time, consuming its own output.
+        # Nothing in the one-step objective constrains how the predictor TRANSFORMS inherited
+        # error, so error can be amplified each step (e_{k+1} ~ L*e_k + eps). This term adds
+        #   sum_{k=2..K} gamma^(k-1) * || rollout_k(z) - sg(z_{num_hist+k-1}) ||^2
+        # so gradients flow through the COMPOSITION f(f(...)) and the model is penalised for
+        # amplifying its own error. K=1 adds nothing -> bit-identical to the paper.
+        self.rollout_steps = max(1, int(rollout_steps) if rollout_steps else 1)
+        self.rollout_gamma = float(rollout_gamma)
+        # Minimum window: k-step targets need real frames up to index num_hist + K - 1.
+        self.rollout_min_frames = self.num_hist + self.rollout_steps
 
         # Effective ABSOLUTE lambda per scale (= straighten_scale * weight); for logging/inspection.
         self.straighten_effective_lambdas = [
@@ -373,6 +388,69 @@ class VWorldModel(nn.Module):
         cos = F.cosine_similarity(va, to_goal, dim=-1, eps=1e-6)
         return (1.0 - cos).mean()
 
+    def _inject_action(self, z_frame, act_raw):
+        """Replace the ACTION channels of a predicted latent with the encoded REAL action.
+
+        The action is an INPUT, not something to predict, so during a rollout each newly
+        predicted frame must have its action slot overwritten with the true next action --
+        exactly what `replace_actions_from_z` does inside `rollout()`. This variant is
+        NON-IN-PLACE (built with torch.cat) so it is always safe for autograd during training.
+        z_frame: (b, 1, num_patches, dim);  act_raw: (b, 1, raw_action_dim)
+        """
+        if self.concat_dim != 1:
+            raise NotImplementedError(
+                "Multi-step rollout loss currently supports concat_dim=1 only "
+                f"(got concat_dim={self.concat_dim})."
+            )
+        act_emb = self.encode_act(act_raw)                                  # (b, 1, a)
+        act_tiled = repeat(act_emb.unsqueeze(2), "b t 1 a -> b t f a", f=z_frame.shape[2])
+        act_rep = act_tiled.repeat(1, 1, 1, self.num_action_repeat)          # (b,1,p,action_dim)
+        return torch.cat([z_frame[..., : -self.action_dim], act_rep], dim=-1)
+
+    def rollout_consistency_loss(self, z, act):
+        """Multi-step rollout-consistency loss.
+
+        Mirrors the PLANNING-time procedure (`rollout`): start from the real history
+        z[:, :num_hist], predict, take the newest predicted frame, inject the real action,
+        slide the window, repeat. The k-th prediction is compared against the real latent.
+
+        k=1 is ALREADY covered by the standard one-step `z_loss` in forward(), so only
+        k>=2 contribute to the loss; k=1 is still measured and returned for diagnostics.
+
+        Returns (loss_or_None, logs) where logs holds per-k errors (detached) so the
+        error-vs-k curve -- i.e. whether error is amplified -- is directly observable.
+        """
+        T = z.shape[1]
+        nh = self.num_hist
+        # Cap K by what the window actually holds: predicting frame nh+k-1 needs T > nh+k-1.
+        max_k = min(self.rollout_steps, T - nh)
+        logs = {}
+        if max_k < 1:
+            return None, logs
+
+        hist = z[:, :nh]                       # real frames 0 .. nh-1 (teacher-forced start)
+        total = None
+        for k in range(1, max_k + 1):
+            pred = self.predict(hist)          # (b, nh, p, d)
+            z_next = pred[:, -1:, ...]         # prediction of frame index j
+            j = nh + k - 1                     # absolute index of the predicted frame
+
+            tgt = z[:, j : j + 1]
+            tgt = tgt.detach() if self.stop_grad else tgt
+            # Compare visual+proprio only (exclude action channels), matching z_loss.
+            err = self.emb_criterion(
+                z_next[..., : -self.action_dim], tgt[..., : -self.action_dim]
+            )
+            logs[f"rollout_err_k{k}"] = err.detach()
+            if k >= 2:                         # k=1 is already in z_loss; don't double-count
+                w = self.rollout_gamma ** (k - 1)
+                total = (w * err) if total is None else (total + w * err)
+
+            if k < max_k:                      # prepare the next step of the rollout
+                z_next = self._inject_action(z_next, act[:, j : j + 1])
+                hist = torch.cat([hist[:, 1:], z_next], dim=1)   # slide, keep exactly nh frames
+        return total, logs
+
     def total_curvature(self, features, mode="cos"):
         if features.shape[1] < 3:
             raise ValueError(f"Features must have at least 3 frames for curvature calculation, got {features.shape[1]}")
@@ -510,6 +588,17 @@ class VWorldModel(nn.Module):
                 # Per-scale raw curvatures (logging only; detached, does not affect the loss).
                 for _k, _v in getattr(self, "_last_scale_curvatures", {}).items():
                     loss_components[_k] = _v
+
+            # ---- Multi-step rollout consistency (k>=2). rollout_steps=1 -> no-op (paper). ----
+            # Always computed when rollout_steps>1 so the per-k error curve is logged even if
+            # the added loss is None (e.g. window too short); k=1 error is diagnostic only.
+            if self.rollout_steps > 1:
+                roll_loss, roll_logs = self.rollout_consistency_loss(z, act)
+                for _k, _v in roll_logs.items():
+                    loss_components[_k] = _v
+                if roll_loss is not None:
+                    loss = loss + roll_loss
+                    loss_components["rollout_loss_used_for_training"] = roll_loss
         else:
             visual_pred = None
             z_pred = None

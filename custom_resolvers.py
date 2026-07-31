@@ -30,6 +30,15 @@ def _fmt_num(x):
     return ("%g" % float(x))
 
 
+def _scalar_or_none(v):
+    """Normalize an OmegaConf scalar (None / 'null' / 'none' / number) to a value or None."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return None if v.strip().lower() in ("none", "null", "") else v
+    return v
+
+
 def straighten_tag(scales=None, lambdas=None, weights=None) -> str:
     """Build a filesystem-safe suffix that encodes the multi-scale straightening settings,
     so every distinct setting gets its OWN checkpoint folder (no collisions, self-documenting,
@@ -63,6 +72,22 @@ def straighten_tag(scales=None, lambdas=None, weights=None) -> str:
     return ("_" + "_".join(parts)) if parts else ""
 
 
+def rollout_tag(rollout_steps=1, rollout_gamma=0.9) -> str:
+    """Suffix encoding the multi-step rollout-consistency setting, so those runs get their OWN
+    checkpoint folder. Returns '' for rollout_steps<=1 (the paper default), keeping
+    paper-faithful run names byte-identical.
+
+    Example: (rollout_steps=4, rollout_gamma=0.9) -> "_roll4g0.9"
+    """
+    k = _scalar_or_none(rollout_steps)
+    k = int(float(k)) if k is not None else 1
+    if k <= 1:
+        return ""
+    g = _scalar_or_none(rollout_gamma)
+    g = float(g) if g is not None else 0.9
+    return f"_roll{k}g{_fmt_num(g)}"
+
+
 def run_variant_tag(epochs, seed=0) -> str:
     """Suffix encoding training length (and non-zero training seed) so runs at different
     epoch counts / seeds land in their OWN folders (planning outputs inherit it via model_name).
@@ -84,6 +109,7 @@ def run_variant_tag(epochs, seed=0) -> str:
 OmegaConf.register_new_resolver("replace_slash", replace_slash)
 OmegaConf.register_new_resolver("replace_substring", replace_substring)
 OmegaConf.register_new_resolver("straighten_tag", straighten_tag)
+OmegaConf.register_new_resolver("rollout_tag", rollout_tag)
 OmegaConf.register_new_resolver("run_variant_tag", run_variant_tag)
 
 if __name__ == "__main__":
