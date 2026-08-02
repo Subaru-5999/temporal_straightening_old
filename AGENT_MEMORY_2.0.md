@@ -1852,3 +1852,33 @@ same `logs.json`**, interleaving two different experiments. Added `initmode_tag`
 `_gtinit` suffix on `conf/plan_gd.yaml`, `conf/plan_gd_mpc.yaml`, `conf/plan_cem.yaml`; empty for
 normal runs so reportable paths are byte-identical. When reading the pre-fix `opt100` logs.json,
 entries are in run order: arm A first, arm C second.
+
+### 22.16 Two operational traps (both hit, both now removed by `probe_planner.py`)
+
+**Trap 1 — the plan output dir is ~6 levels deep, so shell globs miss it.**
+`ckpt_base_path` is passed as an ABSOLUTE path and Hydra embeds it verbatim in the dir template,
+producing:
+```
+plan_outputs_gd/<NAME>_gH25_dset/workspace/arun/temporal_straightening_old/checkpoints_baseline_matched/test/<NAME>_gd_lr0.1_an0_opt100_objlast_initzero/
+```
+A one-level glob (`*opt100_objlast_initzero/logs.json`) never matches. Do not guess the path —
+plan.py prints it (`"Planning result saved dir: ..."`), so parse that line. To search by hand:
+`find plan_outputs_gd -name logs.json -path "*opt100*"`.
+
+**Trap 2 — multi-line shell commands with `\` continuations break on paste.**
+Symptom: `bash: objective.alpha=1: command not found`, then plan.py runs with `model_name=null`
+and Hydra dies inside `replace_slash(None)`:
+`InterpolationResolutionError: AttributeError ... 'NoneType' object has no attribute 'replace'`
+at `full_key: hydra.run.dir`. That traceback is a **paste artifact**, not a code bug. Lesson:
+hand the user a single-token invocation (a repo script), never a multi-line continuation block.
+
+**`probe_planner.py`** removes both: one invocation, sets the MIG env recipe itself, calls plan.py
+as a subprocess (the pattern `reproduce_table1.py` already uses), parses the saved dir from
+stdout, pulls `obj_init`/`obj_final`/`pathdev_init`/`pathdev_final` from that run's logs.json, and
+prints one table with an over-optimization verdict. `--gt-init` is labelled privileged and lands
+in a `_gtinit` folder.
+
+Guard built into the report: if success peaks below the largest probe it prints NON-MONOTONE and
+explicitly warns that the peak must **not** be reported as a result (that would be eval tuning),
+that it needs confirming across seeds 100/200/300, and that the project's detection floor is
+~11.5 pp.
