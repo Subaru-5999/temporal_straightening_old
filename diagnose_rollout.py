@@ -54,21 +54,9 @@ os.environ.setdefault("DATASET_DIR", "/workspace/arun/data")
 os.environ.setdefault("WANDB_MODE", "disabled")
 os.environ.setdefault("WANDB_SILENT", "true")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
-os.environ.setdefault("MUJOCO_GL", "egl")
-os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-os.environ.setdefault("D4RL_SUPPRESS_IMPORT_ERROR", "1")
-os.environ.setdefault("PLAN_SERIAL_ENV", "1")
 for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_v, "8")
-# We import plan.py (for load_model), which pulls in env.venv -> gym/d4rl -> mujoco-py.
-# mujoco-py needs MuJoCo 210 + the nvidia libs on LD_LIBRARY_PATH at IMPORT time, so set it
-# here exactly as reproduce_table1.py does, before the import below.
-_ld = os.environ.get("LD_LIBRARY_PATH", "")
-for _p in (os.path.expanduser("~/.mujoco/mujoco210/bin"), "/usr/lib/nvidia"):
-    if _p not in _ld.split(":"):
-        _ld = (_ld + ":" + _p) if _ld else _p
-os.environ["LD_LIBRARY_PATH"] = _ld
-# A MIG UUID here breaks mujoco-py's int() parse; PushT needs no MuJoCo but stay consistent.
+# A MIG UUID here breaks mujoco-py's int() parse (see reproduce_table1.py).
 _cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
 if _cvd and not all(p.strip().isdigit() for p in _cvd.split(",") if p.strip()):
     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
@@ -78,8 +66,62 @@ import hydra
 from omegaconf import OmegaConf
 
 import custom_resolvers  # noqa: F401  -- registers the OmegaConf resolvers used by hydra.yaml
-from plan import load_model
 from utils import seed
+
+# NOTE: we deliberately do NOT `from plan import load_model`. plan.py imports
+# `env.venv` -> gym -> d4rl -> mujoco_py at module level, and mujoco_py needs MuJoCo 210 +
+# the nvidia libs on LD_LIBRARY_PATH. Setting os.environ["LD_LIBRARY_PATH"] from inside a
+# running process does NOT help: the dynamic linker reads that variable once, at process
+# startup. reproduce_table1.py gets away with setting it because it launches plan.py as a
+# SUBPROCESS, which inherits the updated env at exec time. Importing in-process instead
+# yields "Import error. Trying to rebuild mujoco_py."
+# This diagnostic needs no simulator at all -- only the dataset and the model -- so the
+# ~30 lines of checkpoint loading below mirror plan.py's load_ckpt/load_model directly.
+ALL_MODEL_KEYS = ["encoder", "predictor", "decoder", "proprio_encoder", "action_encoder"]
+
+
+def load_model(model_ckpt, train_cfg, num_action_repeat, device):
+    """Rebuild the trained VWorldModel from a checkpoint. Mirror of plan.py's load_model.
+
+    Checkpoints store whole nn.Module objects (not state-dicts), so weights_only=False is
+    required on torch>=2.6. Instantiating a DinoV2Encoder first makes sure the dinov2 hub
+    module is importable before unpickling references it.
+    """
+    from models.dino import DinoV2Encoder
+    _ = DinoV2Encoder("dinov2_vits14", "x_norm_patchtokens")
+
+    with open(model_ckpt, "rb") as f:
+        payload = torch.load(f, map_location=device, weights_only=False)
+
+    result = {}
+    for k, v in payload.items():
+        # A has_decoder=false run still writes "decoder": None, so skip None values --
+        # None.to(device) would raise.
+        if k in ALL_MODEL_KEYS and v is not None:
+            result[k] = v.to(device)
+    print(f"loaded epoch {payload['epoch']} from {model_ckpt}")
+
+    if "predictor" not in result:
+        raise ValueError(f"Predictor not found in {model_ckpt}")
+    if "encoder" not in result:
+        result["encoder"] = hydra.utils.instantiate(train_cfg.encoder)
+    result.setdefault("decoder", None)   # unused here; forward() is never called
+
+    model = hydra.utils.instantiate(
+        train_cfg.model,
+        encoder=result["encoder"],
+        proprio_encoder=result["proprio_encoder"],
+        action_encoder=result["action_encoder"],
+        predictor=result["predictor"],
+        decoder=result["decoder"],
+        proprio_dim=train_cfg.proprio_emb_dim,
+        action_dim=train_cfg.action_emb_dim,
+        concat_dim=train_cfg.concat_dim,
+        num_action_repeat=num_action_repeat,
+        num_proprio_repeat=train_cfg.num_proprio_repeat,
+    )
+    model.to(device)
+    return model
 
 
 def build_val_loader(train_cfg, num_frames, batch_size):
