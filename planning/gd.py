@@ -146,22 +146,21 @@ class GDPlanner(BasePlanner):
         scheduler = self.get_scheduler(optimizer)
         n_evals = actions.shape[0]
 
-        # Objective value at the FIRST and LAST optimizer step, recorded per eval.
-        # WHY: with `debug_dset_init=true` the planner is initialised AT the ground-truth action
-        # sequence -- a plan that reaches the goal by construction. `obj_init` is then the model's
-        # own cost for a KNOWN-GOOD plan, and `obj_final` the cost of whatever GD converged to.
-        # obj_final < obj_init while success DROPS is direct evidence that minimising this
-        # objective moves away from the task solution, i.e. the objective is misspecified rather
-        # than merely hard to optimise. Diagnostic only; costs nothing and changes no gradient.
-        obj_init = obj_final = None
-        # PATH SHAPE at the first and last optimizer step, as a raw measurement -- NOT a loss.
-        # Paired with `debug_dset_init=true` (planner initialised at the dataset's own successful
-        # actions) this gives, within one run and one task, the path statistic of a KNOWN-GOOD
-        # plan (step 0) and of whatever GD converged to (step 100). Any gap is measured evidence
-        # that the planner leaves the region real behaviour occupies; no gap means this particular
-        # statistic does not separate them and should not be used as a trust region. Guessing
-        # which statistic matters is what produced the falsified corridor gate -- measure instead.
-        dev_init = dev_final = None
+        # ---- Probe: the model's OWN cost, and a path statistic, BEFORE and AFTER optimization ----
+        # WHY: with `debug_dset_init=true` the planner starts at the dataset action sequence whose
+        # env rollout DEFINED this goal, so it solves the task exactly. `obj_init` is then the
+        # model's cost for a KNOWN-GOOD plan. If GD reaches a LOWER cost while success falls, the
+        # objective's minimizer is not the task solution -- misspecification, not a hard
+        # optimization problem. Measured either side of the loop (2 extra no-grad rollouts, ~2%
+        # on a 100-step run) so it is also defined for `opt_steps=0`, where the planner is a pure
+        # evaluator of its initialization and obj_init == obj_final.
+        def _probe():
+            with torch.no_grad():
+                zo, _ = self.wm.rollout(obs_0=trans_obs_0, act=actions)
+                return (self.objective_fn(zo, z_obs_g, step=step).mean().item(),
+                        corridor_penalty(zo, z_obs_g).sqrt().mean().item())
+
+        obj_init, dev_init = _probe()
 
         for i in tqdm(range(self.opt_steps)):
             optimizer.zero_grad()
@@ -170,14 +169,6 @@ class GDPlanner(BasePlanner):
                 act=actions,
             )
             loss = self.objective_fn(i_z_obses, z_obs_g, step=step)  # (n_evals, )
-            if i == 0:
-                obj_init = loss.detach().mean().item()
-                with torch.no_grad():
-                    dev_init = corridor_penalty(i_z_obses, z_obs_g).sqrt().mean().item()
-            obj_final = loss.detach().mean().item()
-            if i == self.opt_steps - 1:
-                with torch.no_grad():
-                    dev_final = corridor_penalty(i_z_obses, z_obs_g).sqrt().mean().item()
             total_loss = loss.mean() * n_evals  # loss for each eval is independent
             total_loss.backward()
             optimizer.step()
@@ -200,15 +191,18 @@ class GDPlanner(BasePlanner):
                 if np.all(successes):
                     break  # terminate planning if all success
 
-        if obj_init is not None:
-            logs = {
-                f"{self.logging_prefix}/obj_init": obj_init,
-                f"{self.logging_prefix}/obj_final": obj_final,
-                f"{self.logging_prefix}/obj_reduction": obj_init - obj_final,
-            }
-            if dev_init is not None:
-                logs[f"{self.logging_prefix}/pathdev_init"] = dev_init
-            if dev_final is not None:
-                logs[f"{self.logging_prefix}/pathdev_final"] = dev_final
-            self.dump_logs(logs)
+        obj_final, dev_final = _probe()
+        # PRINT as well as dump. MPCPlanner instantiates its sub-planner with
+        # `log_filename=None` (see planning/mpc.py), and BasePlanner.dump_logs is a no-op in that
+        # case -- so every config in this repo, all of which plan through MPCPlanner, silently
+        # discarded these values. stdout always works, and probe_planner.py parses this line.
+        print(f"[probe] {self.logging_prefix} obj_init={obj_init:.8g} obj_final={obj_final:.8g} "
+              f"pathdev_init={dev_init:.6g} pathdev_final={dev_final:.6g}", flush=True)
+        self.dump_logs({
+            f"{self.logging_prefix}/obj_init": obj_init,
+            f"{self.logging_prefix}/obj_final": obj_final,
+            f"{self.logging_prefix}/obj_reduction": obj_init - obj_final,
+            f"{self.logging_prefix}/pathdev_init": dev_init,
+            f"{self.logging_prefix}/pathdev_final": dev_final,
+        })
         return actions, np.full(n_evals, np.inf)  # all actions are valid

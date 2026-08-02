@@ -70,6 +70,26 @@ if _cvd and not all(p.strip().isdigit() for p in _cvd.split(",") if p.strip()):
 RE_SUCCESS = re.compile(r"Success rate:\s*([0-9.]+)")
 RE_SAVEDIR = re.compile(r"Planning result saved dir:\s*(\S+)")
 LOG_KEYS = ("obj_init", "obj_final", "pathdev_init", "pathdev_final")
+# GDPlanner prints this; it does NOT reliably reach logs.json, because MPCPlanner builds its
+# sub-planner with log_filename=None and BasePlanner.dump_logs is then a no-op. Every config here
+# plans through MPCPlanner, so stdout is the only dependable source.
+RE_PROBE = re.compile(r"\[probe\]\s+(\S+)\s+"
+                      r"obj_init=(\S+)\s+obj_final=(\S+)\s+"
+                      r"pathdev_init=(\S+)\s+pathdev_final=(\S+)")
+
+
+def parse_probe(text):
+    """First [probe] line = MPC iteration 0, the plan made from the true initial observation.
+    That is the one the diagnostic is about; later iterations replan from executed states."""
+    m = RE_PROBE.search(text)
+    if not m:
+        return {}
+    return {
+        "obj_init": float(m.group(2)),
+        "obj_final": float(m.group(3)),
+        "pathdev_init": float(m.group(4)),
+        "pathdev_final": float(m.group(5)),
+    }
 
 
 def read_probe_logs(save_dir):
@@ -119,9 +139,13 @@ def run_probe(cfg_name, run_dir, name, steps, alpha, seed, gt_init, extra):
         "success": float(succ[-1]) if succ else None,
         "save_dir": save[-1] if save else None,
     }
+    row.update(parse_probe(text))                    # stdout: always present
     if row["save_dir"]:
-        row.update(read_probe_logs(row["save_dir"]))
-    print(f"   -> success={row['success']}", flush=True)
+        for k, v in read_probe_logs(row["save_dir"]).items():
+            row.setdefault(k, v)                     # logs.json: only if the sub-planner logs
+    print(f"   -> success={row['success']}"
+          + (f"  obj {row['obj_init']:.6g} -> {row['obj_final']:.6g}"
+             if "obj_init" in row else ""), flush=True)
     return row
 
 
@@ -147,13 +171,28 @@ def report(rows, gt_init):
         last = ok[-1]
         print(f"\npeak success {best['success']:.2f} at opt_steps={best['steps']}; "
               f"final probe {last['success']:.2f} at opt_steps={last['steps']}")
-        if best["steps"] != last["steps"] and best["success"] > last["success"]:
+        # n=50 tasks: one task = 2 pp, so treat small gaps as noise, not structure.
+        if best["steps"] != last["steps"] and (best["success"] - last["success"]) > 0.04:
             print("NON-MONOTONE: success falls with more optimization of the SAME objective.")
             print("That is a statement about the objective, not a tuned hyperparameter -- do NOT")
             print("report the peak as a result. Confirm across seeds 100/200/300 before claiming")
             print("anything, and remember the ~11.5 pp detection floor for this project.")
         else:
-            print("Monotone (or peak at the largest probe): no evidence of over-optimization here.")
+            print("Monotone within noise (1 task = 2 pp at n=50): no over-optimization evidence.")
+
+    # The measurement the whole probe exists for.
+    misspec = [r for r in rows
+               if r.get("obj_init") is not None and r.get("obj_final") is not None
+               and r["obj_final"] < r["obj_init"] and r["steps"] > 0]
+    if misspec and gt_init:
+        print("\nMISSPECIFICATION CHECK (gt-init): GD reached a LOWER model cost than a plan that")
+        print("solves the task exactly, at these step counts:")
+        for r in misspec:
+            print(f"   steps={r['steps']:>4}  obj {r['obj_init']:.6g} -> {r['obj_final']:.6g}"
+                  f"  ({100.0*(r['obj_init']-r['obj_final'])/abs(r['obj_init']):.1f}% lower)"
+                  f"  success {r['success']:.2f}")
+        print("If success is below the opt_steps=0 row, the true goal is not the argmin of the")
+        print("latent cost. That is a property of the objective; no encoder regularizer fixes it.")
 
 
 def main():

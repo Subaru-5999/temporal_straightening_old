@@ -1882,3 +1882,80 @@ Guard built into the report: if success peaks below the largest probe it prints 
 explicitly warns that the peak must **not** be reported as a result (that would be eval tuning),
 that it needs confirming across seeds 100/200/300, and that the project's detection floor is
 ~11.5 pp.
+
+### 22.17 Over-optimization hypothesis FALSIFIED; the headroom is now measured and decomposed
+
+PushT, matched straightened baseline, open-loop, seed 100, 50 tasks. One checkpoint, no training.
+
+**Zero init (the reportable configuration):**
+
+| opt_steps | 0 | 10 | 25 | 50 | 100 | 200 |
+|---|---|---|---|---|---|---|
+| success | 0.00 | 0.20 | 0.16 | 0.52 | **0.72** | 0.74 |
+
+Monotone within noise (the 0.20 → 0.16 dip is 10 vs 8 tasks; one task = 2 pp at n=50) and
+**saturating**: 100 → 200 buys +0.02. **The paper's 100 steps sits right at the knee.**
+My over-optimization hypothesis is **falsified for the deployed configuration** — GD is not
+ruining plans by optimizing too long from zero init. Also worth noting: the zero-action plan
+scores 0.00, so all 0.72 is earned by the optimizer.
+
+**Oracle init (`gt_actions`; PRIVILEGED, diagnosis only):**
+
+| opt_steps | 0 | 25 | 100 |
+|---|---|---|---|
+| success | **1.00** | 0.84 | 0.86 |
+
+The damage is **immediate, not cumulative**: by 25 steps it is already down to 0.84, and 100 steps
+gives 0.86 (a 1-task difference from 0.84 — noise). GD leaves the exact solution almost at once
+and settles at ~0.85 regardless of how long it then runs.
+
+#### The picture these two tables produce
+
+GD has distinct attractors, and none of them is the task solution:
+
+| start | GD limit |
+|---|---|
+| oracle (exact solution) | **~0.85** |
+| zero | **~0.73** |
+| — oracle, not optimized at all | 1.00 |
+
+**Decomposed headroom for open-loop PushT (measured, seed 100):**
+
+| quantity | value | what it means |
+|---|---|---|
+| deployed planner | 0.72 | where we are |
+| ceiling for ANY initialization strategy, this objective, 100 steps | **~0.86** | oracle-init limit |
+| true ceiling | 1.00 | the oracle plan itself |
+
+So **+14 points are reachable by initialization alone** — above the project's ~11.5 pp detection
+floor, and enough to move the Table-1 open-loop cell from 74.67 past the paper's 77.33. Anything
+beyond ~0.86 requires changing the objective, because that is where GD converges even when handed
+the answer.
+
+For context, the paper's MPC number (88.67) is **above** the 0.86 oracle-init open-loop ceiling,
+which is consistent: replanning against real observations corrects errors that no open-loop
+initialization can.
+
+#### Bug found: the probe values never reached the log
+
+Every `obj_*`/`pathdev_*` column came back empty. Cause: `MPCPlanner` instantiates its sub-planner
+with `log_filename=None` (planning/mpc.py), and `BasePlanner.dump_logs` is a no-op when that is
+None. Every config here plans through MPCPlanner, so the GDPlanner's dumps were silently
+discarded. Fixed by **printing** a parseable `[probe] ...` line to stdout as well as dumping, and
+having `probe_planner.py` read stdout. Also restructured: the probe is now measured with 2
+no-grad rollouts either side of the loop, so it is defined for `opt_steps=0` too — which is
+exactly the row that gives J(gt_actions), the cost of a plan that solves the task exactly.
+The misspecification claim in §22.14 is therefore still **unquantified**; re-run to get J.
+
+#### Next method candidate: retrieval-based plan initialization (no training, no privileged info)
+
+The measurement says initialization is worth +14 and that from a good start the best move is to
+optimize *little or not at all*. `gt_actions` is privileged, but a legitimate substitute exists:
+for each test pair (z_0, z_g), search the **training** trajectories for the segment whose own
+(start, goal) latent pair best matches, and use that segment's recorded actions as the
+initialization, optionally followed by a few GD steps. Uses only the offline dataset the model was
+trained on — no test-time state, no reward, no success labels, no retraining.
+
+Caveats to respect, given §22.14: the latent metric is a poor plan-ranking criterion, so this must
+be validated as a *situation-matching* device rather than assumed to work, and the number of
+follow-up GD steps is a protocol constant that must not be tuned on test success.
