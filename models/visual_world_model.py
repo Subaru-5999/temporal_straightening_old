@@ -41,6 +41,9 @@ class VWorldModel(nn.Module):
         rollout_gamma=0.9,
         rollout_batch_frac=1.0,
         rollout_checkpoint=True,
+        iso_lambda=0.0,
+        iso_eps=0.1,
+        iso_checkpoint=True,
         **kwargs,
     ):
         super().__init__()
@@ -161,6 +164,24 @@ class VWorldModel(nn.Module):
             )
         else:
             log.info("Multi-step rollout consistency disabled (K=1, paper-exact)")
+
+        # ---- Action-isometry conditioning term (NOVEL; iso_lambda=0 == paper exactly) --------
+        # Targets kappa(B) for B = dz_{t+1}/da_t -- the HORIZON-INDEPENDENT prefactor in the
+        # paper's own conditioning bound, which straightening cannot touch. Deliberately
+        # SCALE-FREE so it cannot be satisfied by shrinking the latent (the failure mode that
+        # sank the rollout-consistency term). Needs NO window widening, so iterations/epoch and
+        # the straightening window stay bit-identical to the paper.
+        self.iso_lambda = float(iso_lambda)
+        self.iso_eps = float(iso_eps)
+        self.iso_checkpoint = bool(iso_checkpoint)
+        if self.iso_lambda > 0:
+            log.info(
+                "Action-isometry conditioning ENABLED: lambda=%s eps=%s grad_checkpoint=%s "
+                "(2 extra predictor calls/step, no window change)",
+                self.iso_lambda, self.iso_eps, self.iso_checkpoint,
+            )
+        else:
+            log.info("Action-isometry conditioning disabled (lambda=0, paper-exact)")
 
         # Effective ABSOLUTE lambda per scale (= straighten_scale * weight); for logging/inspection.
         self.straighten_effective_lambdas = [
@@ -441,16 +462,126 @@ class VWorldModel(nn.Module):
         act_rep = act_tiled.repeat(1, 1, 1, self.num_action_repeat)          # (b,1,p,action_dim)
         return torch.cat([z_frame[..., : -self.action_dim], act_rep], dim=-1)
 
-    def _predict_maybe_ckpt(self, hist):
+    def _predict_maybe_ckpt(self, hist, use_ckpt=None):
         """`predict(hist)` with optional activation checkpointing (training + grad only).
 
         Same output and same gradients as `self.predict(hist)`; trades ~30% extra compute for
-        an O(K) -> O(1) reduction in retained attention activations. Disabled automatically
+        an O(calls) -> O(1) reduction in retained attention activations. Disabled automatically
         when grad is off (eval/val), where there is nothing to retain anyway.
+        use_ckpt=None defaults to the rollout flag (back-compatible); callers with their own
+        knob (e.g. the action-isometry term) pass it explicitly.
         """
-        if self.rollout_checkpoint and self.training and torch.is_grad_enabled():
+        flag = self.rollout_checkpoint if use_ckpt is None else bool(use_ckpt)
+        if flag and self.training and torch.is_grad_enabled():
             return ckpt.checkpoint(self.predict, hist, use_reentrant=False)
         return self.predict(hist)
+
+    def _orthonormal_action_probes(self, b, d_a, device, dtype):
+        """Two per-sample RANDOM ORTHONORMAL directions in raw-action space, (b, 1, d_a) each.
+
+        Orthonormal (not merely random) so the isotropy target is simple: for B^T B = c*I the two
+        directions must give EQUAL squared response and ZERO cross term. Gram-Schmidt on a
+        d_a-vector is negligible cost (d_a = 10 for PushT: frameskip 5 x a 2-D action).
+        """
+        d1 = torch.randn(b, 1, d_a, device=device, dtype=dtype)
+        d1 = d1 / d1.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        d2 = torch.randn(b, 1, d_a, device=device, dtype=dtype)
+        d2 = d2 - (d2 * d1).sum(-1, keepdim=True) * d1          # remove the d1 component
+        d2 = d2 / d2.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        return d1, d2
+
+    def action_isometry_loss(self, z, act, z_pred_first=None):
+        """SCALE-FREE conditioning penalty on the action->latent Jacobian B = dz_{t+1}/da_t.
+
+        MOTIVATION (from the paper's OWN bound, appendix Eq. app_kappaA / main Eq. kappaA).
+        With A = dz_{t+1}/dz_t, B = dz_{t+1}/da_t and W_K the finite-horizon controllability
+        Gramian, the conditioning of the planning Hessian obeys
+
+            kappa_eff(H) = kappa(W_K) <= kappa(B)^2 * kappa(A)^(2(H-1))
+                        <= kappa(B)^2 * ((1+eps)/(1-eps))^(2(H-1)),   eps = ||A - I||_2
+
+        Straightening shrinks eps, i.e. it attacks the SECOND factor only. `kappa(B)^2` is a
+        prefactor that straightening cannot touch and that is HORIZON-INDEPENDENT -- it hurts
+        planning at H=5 exactly as much as at H=50. Once eps is small, kappa_eff is floored at
+        kappa(B)^2 and further pressure on A buys nothing (which is what the multi-scale ties
+        looked like). This term attacks that floor directly by pushing B towards an isometry,
+        kappa(B) -> 1, so equal-size action perturbations move the latent by equal amounts
+        whatever direction they point in.
+
+        SCALE-FREE BY CONSTRUCTION -- this is the lesson from the rollout-consistency failure.
+        That term was satisfiable by SHRINKING the latent, and the model took the shortcut
+        (encoder temporal contrast collapsed ~21%, planning success fell 19-27 points). So this
+        loss constrains only the RATIO of B's singular values, never their magnitude:
+
+            G     = B^T B                       (d_a x d_a, symmetric PSD)
+            c     = trace(G)/d_a                (mean squared response; DETACHED)
+            L_iso = || G/c - I ||_F^2
+
+        B -> s*B leaves L_iso exactly unchanged, so collapse is not a solution.
+
+        ESTIMATOR (no explicit Jacobian). With orthonormal probes d1, d2 and
+        B*d = [f(z, a + eta*d) - f(z, a)] / eta,
+
+            g11 = <Bd1,Bd1>,  g22 = <Bd2,Bd2>,  g12 = <Bd1,Bd2>
+            c   = (g11 + g22)/2                                      (detached)
+            L   = [ (g11 - g22)^2 / 2  +  2*g12^2 ] / c^2
+
+        i.e. penalise unequal response along the two directions plus any cross-coupling. Note
+        `eta` CANCELS: every g scales as 1/eta^2, so numerator and c^2 both scale as 1/eta^4.
+        Only the finite-difference nonlinearity depends on eta, not the loss scale.
+
+        COST: exactly TWO extra PREDICTOR calls (f(z,a) is reused from the base forward). The
+        predictor is tiny here (emb_dim 28, ~0.7M params) and -- unlike the rollout loss -- the
+        calls are INDEPENDENT, not composed, so no chained autograd graph.
+
+        WINDOW: uses only frames 0..num_hist-1 and the action at num_hist-1. NO window widening,
+        so the data pipeline, iterations/epoch and the straightening window stay bit-identical to
+        the paper. This makes it the first extension we can compare to the baseline with the loss
+        term as the ONLY difference.
+
+        Returns (loss_or_None, logs). `iso_response_c` in the logs is the mean squared latent
+        response to a unit action perturbation: the COLLAPSE GUARD. If it falls sharply the model
+        is shrinking B, which is the rollout failure mode; watch it every run.
+        """
+        if self.iso_lambda <= 0:
+            return None, {}
+        nh = self.num_hist
+        ad = self.action_dim
+        d_a = act.shape[-1]                     # RAW action dim (10 for PushT: frameskip 5 x 2-D)
+
+        hist = z[:, :nh]
+        a_t = act[:, nh - 1 : nh]               # the action that drives the predicted frame
+
+        base = z_pred_first if z_pred_first is not None else self._predict_maybe_ckpt(
+            hist, use_ckpt=self.iso_checkpoint
+        )
+        # Finite differences in fp32: under bf16 autocast a difference of two O(1) tensors keeps
+        # only ~3 significant digits, which would swamp the O(eta) signal.
+        f0 = base[:, -1:, ..., : -ad].float()
+
+        d1, d2 = self._orthonormal_action_probes(z.shape[0], d_a, z.device, a_t.dtype)
+        responses = []
+        for d in (d1, d2):
+            frame_p = self._inject_action(hist[:, -1:], a_t + self.iso_eps * d)
+            hist_p = torch.cat([hist[:, :-1], frame_p], dim=1)
+            f_p = self._predict_maybe_ckpt(hist_p, use_ckpt=self.iso_checkpoint)
+            responses.append((f_p[:, -1:, ..., : -ad].float() - f0).flatten(1))
+
+        Bd1, Bd2 = responses
+        g11 = (Bd1 * Bd1).sum(-1)
+        g22 = (Bd2 * Bd2).sum(-1)
+        g12 = (Bd1 * Bd2).sum(-1)
+        c = (0.5 * (g11 + g22)).detach().clamp_min(1e-12)
+        loss = (0.5 * (g11 - g22).pow(2) + 2.0 * g12.pow(2)) / c.pow(2)
+        loss = loss.mean()
+        logs = {
+            "iso_loss_raw": loss.detach(),
+            # collapse guard: mean squared response, converted back to a per-unit-perturbation
+            # figure so it is comparable across runs and across iso_eps settings.
+            "iso_response_c": (c / (self.iso_eps ** 2)).mean().detach(),
+        }
+        return loss, logs
+
 
     def rollout_consistency_loss(self, z, act, z_pred_first=None):
         """Multi-step rollout-consistency loss.
@@ -668,6 +799,16 @@ class VWorldModel(nn.Module):
                 if roll_loss is not None:
                     loss = loss + roll_loss
                     loss_components["rollout_loss_used_for_training"] = roll_loss
+
+            # ---- Action-isometry conditioning (k(B) -> 1). iso_lambda=0 -> no-op (paper). ----
+            # Reuses the base one-step prediction as the finite-difference reference point, so
+            # the term costs exactly two extra predictor calls.
+            iso_loss, iso_logs = self.action_isometry_loss(z, act, z_pred_first=z_pred)
+            for _k, _v in iso_logs.items():
+                loss_components[_k] = _v
+            if iso_loss is not None:
+                loss = loss + self.iso_lambda * iso_loss
+                loss_components["iso_loss_scaled"] = (self.iso_lambda * iso_loss).detach()
         else:
             visual_pred = None
             z_pred = None

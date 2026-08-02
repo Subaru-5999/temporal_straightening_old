@@ -15,9 +15,9 @@ ckpt_base_path: ./checkpoints
 
 hydra:
   run:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${rollout_tag:${training.rollout_steps},${training.rollout_gamma}}${run_variant_tag:${training.epochs},${training.seed}}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${rollout_tag:${training.rollout_steps},${training.rollout_gamma}}${iso_tag:${training.iso_lambda}}${run_variant_tag:${training.epochs},${training.seed}}
   sweep:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${rollout_tag:${training.rollout_steps},${training.rollout_gamma}}${run_variant_tag:${training.epochs},${training.seed}}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${rollout_tag:${training.rollout_steps},${training.rollout_gamma}}${iso_tag:${training.iso_lambda}}${run_variant_tag:${training.epochs},${training.seed}}
     subdir: ${hydra.job.num}
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
@@ -89,6 +89,30 @@ training:
   # 1.0 = whole batch. Try 0.5 if you OOM. Also consider has_decoder=false, which is FREE:
   # the decoder is detached/inert (verified: decoder ON and OFF gave identical eval results).
   rollout_batch_frac: 1.0
+  # ---- Action-isometry conditioning (NOVEL extension; 0 = paper exactly) --------------------
+  # WHY: the paper's own bound (main Eq. kappaA, appendix Eq. app_kappaA) is
+  #     kappa_eff(H) = kappa(W_K) <= kappa(B)^2 * ((1+eps)/(1-eps))^(2(H-1)),  eps = ||A - I||
+  # with A = dz_{t+1}/dz_t, B = dz_{t+1}/da_t, W_K the controllability Gramian. Straightening
+  # shrinks eps, i.e. only the SECOND factor. kappa(B)^2 is a prefactor straightening cannot
+  # touch and it is HORIZON-INDEPENDENT, so it hurts at H=5 as much as at H=50. Once eps is
+  # small, kappa_eff is floored at kappa(B)^2 and more pressure on A buys nothing -- which is
+  # what the multi-scale ties looked like. This term pushes B towards an isometry (kappa(B)->1).
+  #
+  # SCALE-FREE BY CONSTRUCTION, and that is the point. It penalises only the RATIO of B's
+  # singular values (G = B^T B is divided by a DETACHED trace/d_a), never their magnitude, so it
+  # CANNOT be satisfied by shrinking the latent. That shortcut is exactly what the
+  # rollout-consistency term took: encoder temporal contrast collapsed ~21% and planning fell
+  # 19-27 points. Watch `iso_response_c` in the logs as the collapse guard.
+  #
+  # COST: 2 extra PREDICTOR calls/step (independent, not composed) and NO window widening -- so
+  # iterations/epoch, the data pipeline and the straightening window are bit-identical to the
+  # paper. With max_train_steps this gives a comparison where the loss term is the ONLY change.
+  # SET LAMBDA DELIBERATELY: L_iso is dimensionless and O(1)-ish while z_loss ~ 0.012, so start
+  # around 0.01 and check `iso_loss_scaled` stays <= z_loss. The rollout term was allowed to
+  # reach ~3.7x z_loss and crowded out prediction; do not repeat that.
+  iso_lambda: 0.0
+  iso_eps: 0.1          # finite-difference step in raw action units; the loss is invariant to it
+  iso_checkpoint: true  # activation checkpointing on the 2 probe predictor calls
   decoder_start_epoch: 1  # start optimizing decoder at this epoch
   reconstruct_every_x_batch: 1000
   num_reconstruct_samples: 5

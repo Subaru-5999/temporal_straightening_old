@@ -88,6 +88,20 @@ def rollout_tag(rollout_steps=1, rollout_gamma=0.9) -> str:
     return f"_roll{k}g{_fmt_num(g)}"
 
 
+def iso_tag(iso_lambda=0.0) -> str:
+    """Suffix encoding the action-isometry conditioning setting, so those runs get their OWN
+    checkpoint folder. Returns '' for iso_lambda<=0 (the paper default), keeping paper-faithful
+    run names byte-identical.
+
+    Example: iso_lambda=0.01 -> "_iso0.01"
+    """
+    l = _scalar_or_none(iso_lambda)
+    l = float(l) if l is not None else 0.0
+    if l <= 0:
+        return ""
+    return f"_iso{_fmt_num(l)}"
+
+
 def run_variant_tag(epochs, seed=0) -> str:
     """Suffix encoding training length (and non-zero training seed) so runs at different
     epoch counts / seeds land in their OWN folders (planning outputs inherit it via model_name).
@@ -110,6 +124,7 @@ OmegaConf.register_new_resolver("replace_slash", replace_slash)
 OmegaConf.register_new_resolver("replace_substring", replace_substring)
 OmegaConf.register_new_resolver("straighten_tag", straighten_tag)
 OmegaConf.register_new_resolver("rollout_tag", rollout_tag)
+OmegaConf.register_new_resolver("iso_tag", iso_tag)
 OmegaConf.register_new_resolver("run_variant_tag", run_variant_tag)
 
 if __name__ == "__main__":

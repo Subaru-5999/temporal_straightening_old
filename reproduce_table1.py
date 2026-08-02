@@ -94,7 +94,7 @@ def base_cell(name):
       _seed<N>      (e.g. _seed2)      training seed
     'pusht_..._lr1e-05_ms1-4_lam0.1-0.2_ep3_seed1' -> 'pusht_..._lr1e-05'."""
     pat = re.compile(
-        r"_(?:ms[0-9-]+|lam[0-9.\-]+|w[0-9.\-]+|roll\d+g[0-9.]+|ep\d+|seed\d+)$"
+        r"_(?:ms[0-9-]+|lam[0-9.\-]+|w[0-9.\-]+|roll\d+g[0-9.]+|iso[0-9.]+|ep\d+|seed\d+)$"
     )
     prev = None
     while prev != name:

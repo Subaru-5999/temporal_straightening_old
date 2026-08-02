@@ -468,6 +468,9 @@ class Trainer:
             rollout_gamma=self.cfg.training.get("rollout_gamma", 0.9),
             rollout_batch_frac=self.cfg.training.get("rollout_batch_frac", 1.0),
             rollout_checkpoint=self.cfg.training.get("rollout_checkpoint", True),
+            iso_lambda=self.cfg.training.get("iso_lambda", 0.0),
+            iso_eps=self.cfg.training.get("iso_eps", 0.1),
+            iso_checkpoint=self.cfg.training.get("iso_checkpoint", True),
         )
         self._log_trainable_params(self.model, "model")
 
