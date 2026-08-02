@@ -57,6 +57,7 @@ import argparse
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 # Reuse the checkpoint/dataloader machinery and the MIG env defaults verbatim.
@@ -91,7 +92,43 @@ def quantiles(x):
 
 
 @torch.no_grad()
-def measure(run_dir, frames, max_batches, device):
+def objective_floor(model, obs, act, alpha, H):
+    """The planner objective's NOISE FLOOR: the cost the model assigns to the TRUE H-step plan.
+
+    WHY THIS NUMBER MATTERS. Measured on the matched PushT baseline, the objective's value at a
+    plan that solves the task EXACTLY (true final state distance 0.0) is 0.0319, not ~0. That
+    residual is the model's own H-step prediction error: rolling the real actions forward does not
+    land on the real goal latent. GD then drives the objective to 0.0146 -- **54% BELOW the error
+    floor of the very model it is optimizing through** -- and success falls from 1.00 to 0.86.
+    Below the floor the objective cannot rank plans; it is fitting model error.
+
+    This function estimates that floor from the TRAINING/validation distribution alone -- real
+    recorded actions, no test tasks, no privileged state, no success labels -- in the exact units
+    of `planning/objectives.py::objective_fn_last`:
+        floor = MSE(z_hat_H_visual, z_H_visual) + alpha * MSE(z_hat_H_proprio, z_H_proprio)
+    with the means taken over all non-batch dims, matching that function element for element.
+
+    Setup mirrors the eval protocol exactly: one start frame, H model steps
+    (goal_H=25 env steps at frameskip 5 -> H=5), real actions fed at every step.
+    """
+    v = obs["visual"]
+    if v.shape[1] < H + 1 or act.shape[1] < H:
+        return None
+    obs_0 = {k: t[:, :1] for k, t in obs.items()}
+    z_obs_pred, _ = model.rollout(obs_0=obs_0, act=act[:, :H])
+    z_obs_true, _ = model.separate_emb(model.encode(obs, act))
+
+    out = {}
+    for key, weight in (("visual", 1.0), ("proprio", float(alpha))):
+        pred = z_obs_pred[key][:, -1]            # z_hat_H
+        true = z_obs_true[key][:, H]             # the real latent H steps later
+        out[key] = F.mse_loss(pred.float(), true.float()).item() * weight
+    out["floor"] = out["visual"] + out["proprio"]
+    return out
+
+
+@torch.no_grad()
+def measure(run_dir, frames, max_batches, device, alpha=1.0):
     run_dir = Path(run_dir).resolve()
     cfg_path = run_dir / "hydra.yaml"
     ckpt_path = run_dir / "checkpoints" / "model_latest.pth"
@@ -107,12 +144,15 @@ def measure(run_dir, frames, max_batches, device):
     model = load_model(ckpt_path, train_cfg, train_cfg.num_action_repeat, device=device)
     model.eval()
 
-    real, mismatch = [], []
+    real, mismatch, floors = [], [], []
     for i, (obs, act, _state) in enumerate(loader):
         if max_batches and i >= max_batches:
             break
         obs = {k: v.to(device) for k, v in obs.items()}
         act = act.to(device)
+        fl = objective_floor(model, obs, act, alpha, frames - 1)
+        if fl is not None:
+            floors.append(fl)
         z_obs, _ = model.separate_emb(model.encode(obs, act))
         v = z_obs["visual"]                       # (b, T, P, D) -- the PLANNING representation
         b, t = v.shape[0], v.shape[1]
@@ -139,6 +179,10 @@ def measure(run_dir, frames, max_batches, device):
         "mismatch": quantiles(mismatch),
     }
     out["separation"] = out["mismatch"]["p50"] / max(out["real"]["p90"], 1e-8)
+    if floors:
+        out["floor"] = {k: sum(d[k] for d in floors) / len(floors) for k in floors[0]}
+        out["floor"]["_alpha"] = alpha
+        out["floor"]["_H"] = frames - 1
     del model
     torch.cuda.empty_cache()
     return out
@@ -173,6 +217,27 @@ def report(results, sep_thresh=1.5, dev_thresh=0.5):
               f"mismatch_p50={r['mismatch']['p50']:.4f}  separation={sep:.2f}  ->  {verdict}")
         print(f"    suggested corridor_rho = {p90:.3f}   (the corridor real behaviour occupies; "
               f"do NOT tune this against success)")
+
+    if any("floor" in r for r in results):
+        print("\n" + "=" * 100)
+        print("OBJECTIVE NOISE FLOOR  --  the cost the model assigns to the TRUE H-step plan")
+        print("=" * 100)
+        print("Estimated from REAL recorded actions on validation trajectories: no test tasks, no")
+        print("privileged state, no success labels. Units are exactly objective_fn_last's.")
+        print("Optimizing the planning objective BELOW this value is fitting the model's own")
+        print("prediction error -- at that resolution the objective cannot rank plans.\n")
+        head = "run".ljust(44) + f"{'H':>4}{'alpha':>7}{'visual':>12}{'proprio':>12}{'FLOOR':>12}"
+        print(head)
+        print("-" * len(head))
+        for r in results:
+            f = r.get("floor")
+            if not f:
+                continue
+            print(r["_run"][:42].ljust(44) + f"{f['_H']:>4}{f['_alpha']:>7.2g}"
+                  + f"{f['visual']:>12.6f}{f['proprio']:>12.6f}{f['floor']:>12.6f}")
+        print("\nCompare against probe_planner.py's obj_init / obj_final. On the matched PushT")
+        print("baseline the objective at an EXACT solution is 0.0319 and GD reaches 0.0146, i.e.")
+        print("54% below, while success falls 1.00 -> 0.86.")
     if len(results) > 1:
         print("\nMECHANISM CHECK: the corridor prior is a consequence of straightening, so the")
         print("straightened run should show the SMALLER real deviation and the LARGER separation.")
@@ -189,6 +254,8 @@ def main():
     ap.add_argument("--frames", type=int, default=6,
                     help="start + H frames; 6 matches the eval's goal_H=25 at frameskip 5")
     ap.add_argument("--batches", type=int, default=0, help="cap val batches (0 = all)")
+    ap.add_argument("--alpha", type=float, default=1.0,
+                    help="objective.alpha for the noise-floor units (PushT 1, UMaze 0)")
     ap.add_argument("--out", default="results/planning_diagnostic.json")
     args = ap.parse_args()
 
@@ -202,7 +269,7 @@ def main():
     results = []
     for d in dirs:
         print(f"\n>>> {d}", flush=True)
-        r = measure(d, args.frames, args.batches, device)
+        r = measure(d, args.frames, args.batches, device, alpha=args.alpha)
         if r:
             results.append(r)
 
