@@ -62,6 +62,7 @@ if _cvd and not all(p.strip().isdigit() for p in _cvd.split(",") if p.strip()):
     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
 import torch
+import torch.nn.functional as F
 import hydra
 from omegaconf import OmegaConf
 
@@ -161,6 +162,36 @@ def configure_probes(model, K, gamma, scales):
     model.stop_grad = True
 
 
+def scale_free_refs(model, z, K):
+    """Quantities that make the RAW rollout MSE comparable ACROSS models.
+
+    WHY THIS IS NEEDED. rollout_err_k is an MSE in the model's OWN learned latent space. Two
+    checkpoints have two different encoders, so their latents have different scales, and a model
+    whose latents are twice as large shows 4x the MSE at IDENTICAL relative accuracy. Raw
+    cross-model comparison of rollout_err_k is therefore meaningless. (The k1-normalised SHAPE is
+    fine -- dividing by k1 cancels the scale. Curvature is fine too: cosine is scale-invariant.)
+
+    Two references, both in the same units as rollout_err_k, so the ratio is dimensionless:
+      persist_err_k : the "do nothing" predictor -- hold the last real history frame and compare
+                      it to the real frame k steps later. This is the error any useful model must
+                      beat, and it scales with the latent exactly as rollout_err_k does.
+      z_rms         : RMS of the visual+proprio latent, exposing the scale difference directly.
+
+    skill_k = rollout_err_k / persist_err_k  is then a scale-free score: < 1 means the predictor
+    beats persistence, and it can be compared between checkpoints.
+    """
+    nh = model.num_hist
+    ad = model.action_dim
+    zt = z[..., :-ad]                       # visual+proprio only, matching rollout_err_k
+    last = zt[:, nh - 1 : nh]               # last REAL history frame, the persistence prediction
+    out = {}
+    for k in range(1, K + 1):
+        j = nh + k - 1
+        out[f"persist_err_k{k}"] = F.mse_loss(last, zt[:, j : j + 1]).detach()
+    out["z_rms"] = zt.pow(2).mean().sqrt().detach()
+    return out
+
+
 @torch.no_grad()
 def measure(run_dir, frames, K, gamma, scales, max_batches, device):
     run_dir = Path(run_dir).resolve()
@@ -200,6 +231,7 @@ def measure(run_dir, frames, K, gamma, scales, max_batches, device):
         _, logs = model.rollout_consistency_loss(z, act)
         model.total_curvature(model.visual_only(z), mode="aggcos")
         logs.update(model._last_scale_curvatures)
+        logs.update(scale_free_refs(model, z, K))
 
         for k, v in logs.items():
             sums[k] = sums.get(k, 0.0) + float(v)
@@ -238,6 +270,21 @@ def report(results, K, scales):
     print("\nReference shapes for K=4: flat 1/1/1/1 = no accumulation;")
     print("linear 1/2/3/4 = independent errors, unit gain; 1/4/9/16 = aligned errors, unit gain.")
     print("Anything steeper than linear indicates amplification.")
+
+    print("\n" + "=" * 78)
+    print("SKILL vs PERSISTENCE  = rollout_err_k / persist_err_k   (scale-free, <1 is better)")
+    print("=" * 78)
+    print("The raw MSEs above are in each model's OWN latent space and are NOT comparable across")
+    print("checkpoints; dividing by the 'hold the last real frame' error cancels that scale.")
+    print("run".ljust(40) + f"{'z_rms':>9}" + "".join(f"{'skill_k'+str(k):>11}"
+                                                      for k in range(1, K + 1)))
+    for r in results:
+        row = r["_run"][:38].ljust(40) + f"{r.get('z_rms', float('nan')):>9.4f}"
+        for k in range(1, K + 1):
+            e = r.get(f"rollout_err_k{k}", float("nan"))
+            p = r.get(f"persist_err_k{k}", float("nan"))
+            row += f"{e / p:>11.4f}"
+        print(row)
 
     if curv_keys:
         print("\n" + "=" * 78)
