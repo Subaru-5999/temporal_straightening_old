@@ -1033,3 +1033,90 @@ curve would mean the compounding premise is wrong for this model, which would ki
 ### 20.8 Status
 Code complete and locally verified; **awaiting the pod run**. Nothing empirical yet — do not claim
 any success rate for this route until the eval table exists.
+
+### 20.9 RESULT — the rollout loss HURTS open-loop planning (clear negative)
+
+Run `pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05_roll4g0.9_ep3`,
+K=4, gamma=0.9, `has_decoder=false`, iteration-matched at exactly 141,996 steps
+(`Reached max_train_steps=141996 at epoch 3 (batch 35653)`), 3 data seeds, 50 tasks.
+
+| Run | Open-loop | MPC |
+|---|---|---|
+| Baseline `MSE + 0.1*L1` | 74.67 +/- 6.43 | 88.67 +/- 6.11 |
+| Paper target | 77.33 +/- 6.18 | 85.33 +/- 4.99 |
+| **`_roll4g0.9` (K=4)** | **56.00 +/- 6.00**  (seeds 62, 56, 50) | *pending* |
+
+**-18.67 pp open-loop.** Pooled difference SE ~= 5.1 -> z ~= 3.7, far past the ~11.5 pp MDE
+(section 6). This is NOT seed scatter. First result in this project that is unambiguously
+significant -- and it is in the wrong direction.
+
+### 20.10 Why: the premise did not hold, measured
+
+Final per-k rollout error (val in brackets), normalised to k=1:
+
+| k | train MSE | ratio | val MSE | ratio |
+|---|---|---|---|---|
+| 1 | 0.010495 | 1.000 | 0.008903 | 1.000 |
+| 2 | 0.014545 | 1.386 | 0.012597 | 1.415 |
+| 3 | 0.017834 | 1.699 | 0.015705 | 1.764 |
+| 4 | 0.021803 | 2.077 | 0.019541 | 2.195 |
+
+Growth is `k^0.53` in MSE. Reference shapes: independent errors at unit gain -> linear
+(1/2/3/4); aligned errors at unit gain -> quadratic (1/4/9/16); geometric amplification ->
+steeper still. Observed is **slower than all of them**, i.e. the predictor was already roughly
+non-amplifying or mildly CONTRACTIVE over 4 steps. **There was little amplification to remove.**
+
+CAVEAT that limits this: the curve is from the model trained WITH the loss, so "the loss
+flattened it" and "it was never steep" look identical. The control (same curve on the baseline
+checkpoint, forward-only) is `diagnose_rollout.py`, commit 1d793a8 -- NOT YET RUN.
+
+SECOND caveat, design-level, that I should have raised before the run: the training rollout
+feeds REAL dataset actions, so it measures compounding along IN-DISTRIBUTION trajectories.
+The failure mode we were chasing (77->57->32->12 at H=5,6,8,10) happens with GD-CHOSEN
+actions, which drift off-distribution. The diagnostic and the failure mode are different
+quantities.
+
+### 20.11 Loss composition — the term was far too heavy (my mistake)
+
+From the final logged values: rollout contribution
+`0.9(0.01455) + 0.81(0.01783) + 0.729(0.02180) = 0.0434`
+against total loss 0.0753, with `z_loss ~= 0.0117` and curvature `0.1 * 0.2021 = 0.0202`.
+
+So the NEW term was the **largest single component, ~3.7x the one-step prediction loss.**
+`rollout_gamma=0.9` with K=4 and no overall lambda was an aggressive re-weighting of the
+objective that I never scaled against the existing terms. Any future attempt MUST put an
+explicit lambda on this term (e.g. total contribution ~0.01, comparable to z_loss) rather
+than letting the gamma-sum set its own scale.
+
+### 20.12 UNTESTED hypothesis for the mechanism (do not assert)
+
+Lowering multi-step error can be achieved by making the predictor more CONTRACTIVE. A
+contractive predictor shrinks `dz_H/da_t`, which is exactly the gradient GD planning descends.
+That would mean we improved rollout fidelity while FLATTENING the planning landscape --
+consistent with open-loop (one 100-step GD solve through the full 5-step rollout) degrading
+sharply. The sub-linear error curve is weak circumstantial support for contraction.
+
+Test before believing it (section 19.5): measure the norm and conditioning of `dz_H/da` at the
+planning start states across checkpoints. Cheap extension of `diagnose_rollout.py`.
+Note this connects to the paper's own conditioning argument and to the action-isometry idea in
+`STUDY_PACKAGE/03_...md` section 8, which targets `kappa(B)` for `B = dz_{t+1}/da_t`.
+
+### 20.13 Confounds still attached to the -18.67
+
+1. **Straightening window (real, unresolved).** This run straightened over the widened 7-frame
+   window = 5 curvature triplets; the baseline used 4 frames = 2 triplets. `total_curvature`
+   consumes the FULL window (`forward()` passes `visual_only(z)` with all T frames). Unlikely to
+   explain 18.67 pp -- the 9-frame multi-scale run TIED with the baseline -- but not ruled out.
+   Isolating it needs a 7-frame control with `rollout_steps=1`, which no current knob produces
+   (lambda=0 disables a scale AND its widening). Fix if ever needed: slice the curvature input to
+   `max(num_hist+num_pred, 2*max_active_scale+1)` frames -- a no-op for every run done so far.
+2. **`has_decoder=false` RNG offset (nuisance).** `models/vqvae.py` L38 draws
+   `torch.randn(dim, n_embed)` at construction, and the decoder is built AFTER the predictor in
+   `init_models`, so turning it off shifts the predictor's dropout stream. No gradient path
+   (`decode(z.detach())`), dataset shuffling unaffected (seeded before `init_models`).
+
+### 20.14 Cost correction
+
+Measured **1.05 s/it**, not the ~0.5 s/it I projected from the multi-scale run. Total ~41 h for
+141,996 steps. My "+30%" figure applies per checkpointed call; with 3 of them plus backward
+through 4 composed predictor graphs, step time roughly **doubled**. Budget accordingly.
