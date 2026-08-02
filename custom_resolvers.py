@@ -116,6 +116,24 @@ def arc_tag(straighten_speed_lambda=0.0) -> str:
     return f"_arc{_fmt_num(l)}"
 
 
+def initmode_tag(debug_dset_init=False) -> str:
+    """Suffix marking a run whose planner was initialised at the DATASET's ground-truth actions
+    (`debug_dset_init=true`). Returns '' otherwise, so normal runs keep byte-identical paths.
+
+    Necessary because the plan output dir encodes `init${planner.sub_planner.sample_type}`, which
+    stays 'zero' regardless of this flag -- so a gt-initialised run and a zero-initialised run
+    with the same opt_steps landed in the SAME folder and APPENDED to the same logs.json,
+    silently interleaving two different experiments.
+
+    gt_actions is privileged information: this tag exists so diagnostic runs can never be
+    mistaken for, or mixed into, reportable numbers.
+    """
+    v = _scalar_or_none(debug_dset_init)
+    if isinstance(v, str):
+        v = v.strip().lower() in ("true", "1", "yes")
+    return "_gtinit" if bool(v) else ""
+
+
 def corridor_tag(corridor_beta=0.0, corridor_rho=0.0) -> str:
     """Suffix encoding the latent-geodesic-corridor planning objective, so corridor evals land in
     their OWN plan_outputs folder and can never be mixed with the paper-faithful numbers.
@@ -157,6 +175,7 @@ OmegaConf.register_new_resolver("rollout_tag", rollout_tag)
 OmegaConf.register_new_resolver("iso_tag", iso_tag)
 OmegaConf.register_new_resolver("arc_tag", arc_tag)
 OmegaConf.register_new_resolver("corridor_tag", corridor_tag)
+OmegaConf.register_new_resolver("initmode_tag", initmode_tag)
 OmegaConf.register_new_resolver("run_variant_tag", run_variant_tag)
 
 if __name__ == "__main__":

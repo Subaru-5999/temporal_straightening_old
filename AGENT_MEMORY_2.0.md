@@ -1777,3 +1777,78 @@ Reading:
 `pathdev_init` / `pathdev_final` come along free in arm C: the path statistic of a known-good
 plan vs GD's converged plan, on the same tasks. That is the measured replacement for the
 falsified guessed corridor statistic (§22.10).
+
+### 22.14 **DECISIVE RESULT** — both failure modes are real, and quantified
+
+PushT, matched straightened baseline, open-loop, seed 100, 50 tasks, one checkpoint, no training.
+
+| arm | init | opt_steps | success | mean state_dist |
+|---|---|---|---|---|
+| **B** oracle ceiling | `gt_actions` | 0 | **1.00** | **0.000** (exactly zero, all 50) |
+| **C** optimize from oracle | `gt_actions` | 100 | **0.86** | ~19 (range 7.5–40.0) |
+| **A** the deployed planner | zero | 100 | **0.72** | ~40 (range 8–182) |
+
+Arm B validates the harness: all 50 tasks succeed with `state_dist` **identically 0.0**, and the
+run took 6.8 s with an empty progress bar, confirming §22.12's fix actually delivers the
+initialization to the optimizer.
+
+#### Finding 1 — minimizing the latent objective DESTROYS working plans (1.00 → 0.86)
+
+Starting from a plan that solves the task exactly, 100 Adam steps on
+`||ẑ_H − z_g||² + α·proprio` break **7 of 50 tasks** and move the true final state from a
+distance of 0 to a mean of ~19. The optimizer is doing its job — it lowers the model's cost — and
+task performance falls. **The objective's minimizer is not the task solution.** No encoder-side
+regularizer can fix that, which is a coherent explanation for why five representation-side
+extensions produced no win.
+
+#### Finding 2 — initialization is worth just as much (0.72 → 0.86)
+
+Same objective, same 100 steps, only the starting point differs: +14 points. So GD from zero init
+is also failing to reach the good region.
+
+#### Per-task decomposition (indices of failures)
+
+- A fails 14: `1,5,8,11,12,22,23,24,25,28,38,40,42,46`
+- C fails 7: `5,11,12,15,17,23,46`
+
+| class | count | share | reading |
+|---|---|---|---|
+| fail from BOTH inits | 5 (`5,11,12,23,46`) | 10% | objective/model wrong for these regardless of start |
+| fail from zero, succeed from oracle | 9 | 18% | basin / initialization problem |
+| succeed from zero, fail from oracle | 2 (`15,17`) | 4% | GD actively destroyed a plan zero-init happened to solve |
+
+The 2-task class is the cleanest possible demonstration that this is pathology, not an ordering:
+optimization from a *better* start produced a *worse* outcome on those tasks.
+
+#### CRITICAL consequence — argmin-J selection is compromised
+
+The obvious label-free fix for Finding 2 is multi-start with the candidate of lowest model cost
+selected. Finding 1 says that selection rule is **partly anti-correlated with success near the
+solution**: J(gt) is not the minimum, and GD reaches lower J while doing worse. So a naive
+"generate K starts, keep the lowest J" can actively pick worse plans. Any multi-start design must
+be validated against this, not assumed. (This retracts the confident framing of the
+"initialization branch" in §22.13.)
+
+#### The next measurement this implies (cheap, forward-only)
+
+Finding 1 says the latent cost is not monotone in true task distance near the goal. That is
+directly checkable and it bears on the paper's central claim that straightening makes Euclidean
+latent distance a good proxy for geodesic distance. Our result is stronger and more specific:
+**the true goal is not even the argmin.** Confirm with `obj_init` vs `obj_final` from arm C's
+`logs.json` — if `obj_final < obj_init` while `state_dist` went 0 → 19, monotonicity is broken and
+quantified.
+
+Second implication: if optimizing hurts, the paper's 100 steps may be past the peak. A
+success-vs-`opt_steps` sweep at zero init (10/25/50/100/200) costs ~1 min per point open-loop and
+would show whether the deployed planner over-optimizes. Note: choosing a stopping point by test
+success would be eval tuning — the sweep is to establish whether the curve is non-monotone, which
+is a claim about the objective, not a tuned hyperparameter.
+
+### 22.15 Results-mixing hazard found and fixed
+
+The plan output dir encodes `init${planner.sub_planner.sample_type}`, which stays `zero`
+regardless of `debug_dset_init`. So **arms A and C wrote to the same folder and appended to the
+same `logs.json`**, interleaving two different experiments. Added `initmode_tag` →
+`_gtinit` suffix on `conf/plan_gd.yaml`, `conf/plan_gd_mpc.yaml`, `conf/plan_cem.yaml`; empty for
+normal runs so reportable paths are byte-identical. When reading the pre-fix `opt100` logs.json,
+entries are in run order: arm A first, arm C second.
