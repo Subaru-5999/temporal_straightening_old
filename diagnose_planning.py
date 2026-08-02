@@ -122,8 +122,18 @@ def objective_floor(model, obs, act, alpha, H):
     for key, weight in (("visual", 1.0), ("proprio", float(alpha))):
         pred = z_obs_pred[key][:, -1]            # z_hat_H
         true = z_obs_true[key][:, H]             # the real latent H steps later
+        start = z_obs_true[key][:, 0]            # the "do nothing" prediction
         out[key] = F.mse_loss(pred.float(), true.float()).item() * weight
+        out["persist_" + key] = F.mse_loss(start.float(), true.float()).item() * weight
     out["floor"] = out["visual"] + out["proprio"]
+    out["persist"] = out["persist_visual"] + out["persist_proprio"]
+    # SCALE-FREE floor. `floor` is an MSE in each model's OWN latent space, so it is NOT
+    # comparable across checkpoints -- a model whose latents are twice as large shows 4x the floor
+    # at identical relative accuracy (the same trap documented for rollout_err in
+    # diagnose_rollout.py). Dividing by the cost of the "stay at the start latent" plan, which
+    # scales identically, cancels that. rel_floor is the fraction of the total latent motion the
+    # model cannot predict -- and it is directly comparable to open-loop success across runs.
+    out["rel_floor"] = out["floor"] / max(out["persist"], 1e-12)
     return out
 
 
@@ -226,18 +236,26 @@ def report(results, sep_thresh=1.5, dev_thresh=0.5):
         print("privileged state, no success labels. Units are exactly objective_fn_last's.")
         print("Optimizing the planning objective BELOW this value is fitting the model's own")
         print("prediction error -- at that resolution the objective cannot rank plans.\n")
-        head = "run".ljust(44) + f"{'H':>4}{'alpha':>7}{'visual':>12}{'proprio':>12}{'FLOOR':>12}"
+        head = ("run".ljust(40) + f"{'H':>4}{'FLOOR':>11}{'persist':>11}"
+                f"{'REL_FLOOR':>12}")
         print(head)
         print("-" * len(head))
         for r in results:
             f = r.get("floor")
             if not f:
                 continue
-            print(r["_run"][:42].ljust(44) + f"{f['_H']:>4}{f['_alpha']:>7.2g}"
-                  + f"{f['visual']:>12.6f}{f['proprio']:>12.6f}{f['floor']:>12.6f}")
-        print("\nCompare against probe_planner.py's obj_init / obj_final. On the matched PushT")
-        print("baseline the objective at an EXACT solution is 0.0319 and GD reaches 0.0146, i.e.")
-        print("54% below, while success falls 1.00 -> 0.86.")
+            print(r["_run"][:38].ljust(40) + f"{f['_H']:>4}"
+                  + f"{f['floor']:>11.6f}{f['persist']:>11.6f}{f['rel_floor']:>12.4f}")
+        print("\nREL_FLOOR is the comparable one: raw `floor` is an MSE in each model's own latent")
+        print("space, so it is meaningless across checkpoints (a model with 2x larger latents shows")
+        print("4x the floor at identical relative accuracy). rel_floor = floor / persist is the")
+        print("fraction of the real latent motion the model CANNOT predict at H steps.")
+        print("\nWHY IT MATTERS (measured on the matched PushT baseline, seed 100): from a zero")
+        print("init GD reaches obj 0.0434 at the paper's 100 steps, versus a floor of 0.0319 --")
+        print("i.e. it stops 1.36x above the floor, right where the objective runs out of")
+        print("information. So the open-loop plateau at 0.72 is set by this floor. The testable")
+        print("consequence: across checkpoints, rel_floor should ANTI-correlate with open-loop")
+        print("success. Run this on several PushT runs and check that before training anything.")
     if len(results) > 1:
         print("\nMECHANISM CHECK: the corridor prior is a consequence of straightening, so the")
         print("straightened run should show the SMALLER real deviation and the LARGER separation.")

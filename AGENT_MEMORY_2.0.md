@@ -2043,3 +2043,90 @@ implement any stopping rule before it.
 - This explains where the loss comes from; it does not yet recover a single point of success. The
   measured headroom (§22.17) stands at 0.72 → ~0.86 for initialization, ~0.86 → 1.00 only via the
   objective.
+
+### 23.7 Zero-init obj trajectory: **the floor-stopping rule is DEAD, and the knee IS the floor**
+
+The measurement §23.5 demanded. PushT matched baseline, open-loop, seed 100, zero init:
+
+| opt_steps | success | obj_final | vs floor 0.0319 | pathdev_init | pathdev_final |
+|---|---|---|---|---|---|
+| 10 | 0.20 | 0.146577 | 4.6× above | 0.1932 | 0.3710 |
+| 25 | 0.16 | 0.102100 | 3.2× above | 0.1932 | 0.3681 |
+| 50 | 0.52 | 0.057434 | 1.8× above | 0.1932 | 0.3601 |
+| **100** | **0.72** | **0.043444** | **1.36× above** | 0.1932 | 0.3685 |
+| 200 | 0.74 | 0.030785 | just below | 0.1932 | 0.3667 |
+
+`obj_init = 0.605163` for the zero-action plan, so GD removes 93% of the cost by 100 steps.
+
+**Possibility 1 from §23.5 is confirmed: from zero init GD never gets below the floor within the
+paper's 100 steps.** It arrives at 1.36× the floor and only crosses at ~200 steps. So a
+floor-triggered stopping rule **never fires** in the deployed configuration — it cannot hurt, and
+it cannot help. **Route closed.** (Third pre-registered kill, after the corridor and
+over-optimization.)
+
+#### The much more valuable thing this reveals
+
+Cross-referencing §22.17: success saturates at exactly the point where `obj_final` reaches the
+floor. 100 steps → 1.36× floor → 0.72; 200 steps → 1.0× floor → 0.74 (flat). **The knee in the
+success-vs-steps curve IS the noise floor.** The paper's choice of 100 steps is not arbitrary and
+not tunable: it is where the objective stops carrying information about plan quality.
+
+And success is demonstrably **not monotone in the objective** across the regimes we have measured:
+
+| plan | obj | success |
+|---|---|---|
+| GD from zero, 100 steps | 0.0434 | 0.72 |
+| the exact solution | 0.0319 | **1.00** |
+| GD from oracle, 100 steps | 0.0146 | 0.86 |
+
+Lower cost, worse outcome, twice over. The objective is informative while `J >> floor` (0.605 →
+0.043 tracks 0.20 → 0.72) and uninformative once `J ~ floor`.
+
+`pathdev` again confirms the corridor is irrelevant: the zero-action plan starts at 0.1932 and GD
+raises it to ~0.367, i.e. GD moves *toward* the real-data value (0.398) on its own. Nothing to fix.
+
+#### The one hypothesis that survives, and it is a TRAINING-side one
+
+**The open-loop plateau is set by the model's H-step prediction-error floor.** Lower the floor and
+the objective stays informative for longer, so GD can keep making real progress. That is a
+statement about the world model, i.e. exactly the "novel mathematics in the straightening code"
+target — and it is derived from measurement rather than from geometric taste, unlike the five
+representation-side objectives that failed (§22.1).
+
+It also re-frames §20: the rollout-consistency loss aimed at precisely this target and **the target
+was right; the implementation was wrong.** It used an ABSOLUTE latent error, which is satisfiable
+by shrinking the latent, and the model took that shortcut (temporal mobility −21%, per-k error 3×
+worse, planning −18.7/−26.7). The fix is the same lesson as §21: make the quantity **scale-free**.
+
+#### MANDATORY next step: test the hypothesis on checkpoints we ALREADY have (no training)
+
+Before any training run, check that the floor actually predicts open-loop success. We have ~6 PushT
+checkpoints with recorded OL numbers spanning 56–77%:
+
+| run | recorded OL |
+|---|---|
+| `ms1-4_lam0.1-0.2_ep3` (multi-scale) | 76.67 |
+| single-scale 2ep (paper setting) | 75.33 |
+| `ms1-4_lam0.1-0_ep3` (matched baseline) | 74.67 |
+| single-scale 3ep | 70.67 |
+| `ms1-2-3-4_...` (dense multi-scale) | 68.67 |
+| `roll4g0.9_ep3` (rollout) | **56.00** |
+
+`diagnose_planning.py` now reports **`rel_floor = floor / persist`** — scale-free, so comparable
+across checkpoints (raw `floor` is an MSE in each model's own latent units and is NOT comparable,
+the same trap documented for `rollout_err` in §20).
+
+**Pre-registered prediction: `rel_floor` anti-correlates with open-loop success across these runs.**
+The rollout run is the strongest test — it has ~3× worse multi-step error and the worst OL success
+by 19 points, so it should sit at the far end of the line. If the correlation holds across n≈6, the
+mechanism is established on existing data and a floor-reducing loss is justified. If it does not
+hold, the plateau is NOT prediction error and the whole thread is closed. Either way it costs one
+forward pass per checkpoint.
+
+#### Still blocked on σ_train regardless of outcome
+
+§15.3's finding stands: same loss, budget-only changes gave MPC 82.00 → 88.67 → 84.67 and one
+checkpoint's eval seeds spanned 12 points. Every arm to date is n=1 training run. No novel-loss
+claim is defensible until the baseline is run with 3 training seeds to establish σ_train. The
+correlation study above does not need it (it uses already-measured success numbers), but the
+eventual training arm does.
