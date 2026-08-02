@@ -1120,3 +1120,81 @@ Note this connects to the paper's own conditioning argument and to the action-is
 Measured **1.05 s/it**, not the ~0.5 s/it I projected from the multi-scale run. Total ~41 h for
 141,996 steps. My "+30%" figure applies per checkpointed call; with 3 of them plus backward
 through 4 composed predictor graphs, step time roughly **doubled**. Budget accordingly.
+
+### 20.15 FINAL RESULT — rollout-consistency loss is a DECISIVE NEGATIVE (route closed)
+
+All at matched 141,996 steps, PushT, straighten aggcos1e-1, encoder_lr 1e-5, 3 data seeds, 50 tasks:
+
+| Run | Open-loop | MPC |
+|---|---|---|
+| Baseline `MSE + 0.1*L1` (`_ms1-4_lam0.1-0_ep3`) | 74.67 +/- 6.43 | 88.67 +/- 6.11 |
+| Paper target | 77.33 +/- 6.18 | 85.33 +/- 4.99 |
+| s=4 `_ms1-4_lam0.1-0.2_ep3` | 76.67 +/- 6.43 | 88.00 +/- 3.46 |
+| 4-scale `_ms1-2-3-4_lam0.1-0.1-0.075-0.05_ep3` | 68.67 +/- 7.02 | 82.67 +/- 6.43 |
+| 2-epoch (undertrained) `_ms1-4_lam0.1-0.2_ep2` | 48.00 +/- 5.29 | 82.00 +/- 2.00 |
+| **`_roll4g0.9_ep3` (K=4, gamma=0.9)** | **56.00 +/- 6.00** (62/56/50) | **62.00 +/- 10.58** (66/50/70) |
+
+vs baseline: **OL -18.67 (z~3.67), MPC -26.67 (z~3.78).** Both far past the ~11.5 pp MDE, both
+sign-consistent. Highest MPC variance of any run in the table (10.58). Unambiguous harm.
+
+**The most diagnostic single fact in the table:** the UNDERTRAINED 2-epoch run scored WORSE
+open-loop (48.00 < 56.00) yet FAR better on MPC (82.00 >> 62.00). So the rollout model is not
+merely "a weaker model" -- it is specifically and uniquely bad at MPC. MPC/OL ratios:
+
+| run | MPC/OL |
+|---|---|
+| 2-epoch undertrained | 1.708 |
+| 4-scale | 1.204 |
+| baseline | 1.187 |
+| s=4 | 1.148 |
+| **rollout K=4** | **1.107  (lowest)** |
+
+MPC corrects MODEL ERROR by re-observing every 5 env-steps; it cannot correct OPTIMIZER
+failure, because each replan is still a GD solve. Replanning rescued the undertrained model
+almost completely and rescued ours least of all -- while prediction accuracy is precisely what
+the rollout loss improved. That is coherent with the section 20.12 hypothesis (the loss made the
+predictor contractive, shrinking `dz_H/da_t` and flattening the planning landscape) and is hard
+to reconcile with "the model just got worse at predicting". STILL CIRCUMSTANTIAL -- see below.
+
+### 20.16 DECISION RULE for whether a lambda-scaled retry is justified
+
+Two candidate explanations remain, and one cheap measurement separates them:
+
+  (a) **Premise false.** Error never amplified (section 20.10: growth only `k^0.53`), so the term
+      added pressure with no target and cost ~3.7x z_loss of gradient budget. -> CLOSE the route.
+  (b) **Weighting only.** The premise held but the term was grossly over-weighted (section 20.11).
+      -> ONE retry with an explicit lambda (~0.25, bringing the term to ~0.011 ~= z_loss).
+
+`diagnose_rollout.py` (commit 1d793a8) decides it: run the SAME per-k curve on the BASELINE
+checkpoint at a fixed 7-frame window.
+  - baseline curve also shallow (~`k^0.5`)  -> (a). Premise dead. CLOSE, no retry.
+  - baseline curve clearly steeper than ours -> (b). The loss did work; harm came from weighting.
+    A single lambda-scaled retry is then defensible (cost ~41 h train + ~1.5 h eval).
+
+Command (auto-resolves both ckpt roots):
+```bash
+python diagnose_rollout.py --frames 7 --scales 1 --runs-abs \
+  $(ls -d $PWD/checkpoints*/test/*_roll4g0.9_ep3 \
+          $PWD/checkpoints*/test/*_ms1-4_lam0.1-0_ep3 2>/dev/null)
+```
+Do NOT launch a retry before this measurement. Section 19.5 lesson: instrument first.
+
+### 20.17 What survives from this attempt (worth keeping)
+
+- **Negative result, cleanly measured and iteration-matched.** Adding multi-step rollout
+  consistency to a DINO-WM-style latent world model degraded goal-reaching by ~19-27 pp. Reported
+  honestly, this is a useful finding: better autoregressive prediction fidelity did NOT translate
+  into better latent planning, and hurt it.
+- **The measurement that explains why:** latent one-step error compounds only sub-linearly
+  (`k^0.53` in MSE) along in-distribution trajectories. The exposure-bias framing that motivates
+  multi-step losses in sequence modelling does not transfer to this setting as assumed.
+- **The MPC/OL ratio as a diagnostic.** A model whose MPC gain is unusually SMALL points at
+  optimizer/landscape failure rather than prediction failure. New tool for this project.
+- **Infrastructure:** `training.rollout_*` knobs (K=1 is a bit-exact no-op), gradient
+  checkpointing verified to 0.0 gradient difference, `training.max_train_steps` iteration
+  matching, and `diagnose_rollout.py` for fixed-window cross-run probes.
+
+### 20.18 Standing caveats on the -18.67 / -26.67 (unchanged from 20.13)
+Straightening window 7 frames (5 triplets) vs baseline 4 frames (2 triplets) -- unlikely to
+account for effects this large (the 9-frame multi-scale run TIED) but not formally excluded.
+`has_decoder=false` shifts the dropout RNG stream; nuisance-level only.
