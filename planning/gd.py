@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from einops import rearrange
 from .base_planner import BasePlanner
+from .objectives import corridor_penalty
 from utils import move_to_device
 from tqdm import tqdm
 
@@ -148,6 +149,14 @@ class GDPlanner(BasePlanner):
         # objective moves away from the task solution, i.e. the objective is misspecified rather
         # than merely hard to optimise. Diagnostic only; costs nothing and changes no gradient.
         obj_init = obj_final = None
+        # PATH SHAPE at the first and last optimizer step, as a raw measurement -- NOT a loss.
+        # Paired with `debug_dset_init=true` (planner initialised at the dataset's own successful
+        # actions) this gives, within one run and one task, the path statistic of a KNOWN-GOOD
+        # plan (step 0) and of whatever GD converged to (step 100). Any gap is measured evidence
+        # that the planner leaves the region real behaviour occupies; no gap means this particular
+        # statistic does not separate them and should not be used as a trust region. Guessing
+        # which statistic matters is what produced the falsified corridor gate -- measure instead.
+        dev_init = dev_final = None
 
         for i in tqdm(range(self.opt_steps)):
             optimizer.zero_grad()
@@ -158,7 +167,12 @@ class GDPlanner(BasePlanner):
             loss = self.objective_fn(i_z_obses, z_obs_g, step=step)  # (n_evals, )
             if i == 0:
                 obj_init = loss.detach().mean().item()
+                with torch.no_grad():
+                    dev_init = corridor_penalty(i_z_obses, z_obs_g).sqrt().mean().item()
             obj_final = loss.detach().mean().item()
+            if i == self.opt_steps - 1:
+                with torch.no_grad():
+                    dev_final = corridor_penalty(i_z_obses, z_obs_g).sqrt().mean().item()
             total_loss = loss.mean() * n_evals  # loss for each eval is independent
             total_loss.backward()
             optimizer.step()
@@ -182,9 +196,14 @@ class GDPlanner(BasePlanner):
                     break  # terminate planning if all success
 
         if obj_init is not None:
-            self.dump_logs({
+            logs = {
                 f"{self.logging_prefix}/obj_init": obj_init,
                 f"{self.logging_prefix}/obj_final": obj_final,
                 f"{self.logging_prefix}/obj_reduction": obj_init - obj_final,
-            })
+            }
+            if dev_init is not None:
+                logs[f"{self.logging_prefix}/pathdev_init"] = dev_init
+            if dev_final is not None:
+                logs[f"{self.logging_prefix}/pathdev_final"] = dev_final
+            self.dump_logs(logs)
         return actions, np.full(n_evals, np.inf)  # all actions are valid

@@ -1642,3 +1642,78 @@ one flag and two eval runs away.
 ### 22.9 Status
 
 Implemented and unit-verified. Gate not yet run. No training required at any point.
+
+### 22.10 GATE RESULT: **NO-GO — the corridor prior is FALSE. Route closed.**
+
+Ran `diagnose_planning.py --frames 6` on the matched straightened PushT baseline
+(`checkpoints_baseline_matched/.../ms1-4_lam0.1-0_ep3`), all val batches. Normalised sideways
+deviation `||perp|| / ||z_g - z_0||` over the exact 25-env-step planning window:
+
+| | mean | p50 | p75 | p90 | p95 |
+|---|---|---|---|---|---|
+| real (goal = true 25-step-later frame) | 0.4147 | **0.4067** | 0.5012 | **0.5906** | 0.6597 |
+| mismatch (goal from another trajectory) | 68.06 | **0.3874** | 0.5397 | 0.7276 | 0.9052 |
+
+`separation = 0.66` (needed ≥ 1.5), `real_p90 = 0.591` (needed ≤ 0.5). **Both criteria fail.**
+
+Read the p50s: real paths bow **0.407** off the chord, mismatched paths **0.387**. Real
+trajectories are, at the median, *no straighter than paths heading to an unrelated goal*. The
+mismatch `mean = 68` is a normalisation artifact — when a swapped goal lands near the start,
+`||z_g - z_0||` is tiny and the ratio explodes — so p50/p90 are the only usable reads, and they
+say there is no corridor to exploit. Only the p90 tail shows any ordering (0.59 vs 0.73), far too
+weak to build an objective on.
+
+**Pre-registered exit criterion honoured. `corridor_beta` stays at 0.0, code retained but
+falsified. Do not revive it, and do not re-run it with a looser threshold.**
+
+#### What I got wrong, explicitly
+
+I inferred that "straightening makes Euclidean distance a better proxy for geodesic distance"
+implies the latent path from z_0 to z_g is near the straight chord. **That inference was mine,
+not the paper's.** The paper claims the distance *field* becomes more geodesic-like (heatmaps vs
+A*); it never claims trajectories are chords in the embedding. The measurement says the chord
+property is false, so the corridor was built on an assumption the paper does not make.
+
+#### What the measurement is worth anyway (this part is a real result)
+
+Local curvature at s=1 is ~0.24 (1−cos), i.e. consecutive steps are fairly well aligned. Yet
+across the 5 model steps the planner actually spans, the path bows ~40–60% of the chord length.
+**Local straightness does not imply global chord-following.** That is an independent confirmation
+of §19 — measured this time in the *planning* representation (`z_obs["visual"]`, the projected
+patch latents the objective consumes) rather than the agg head. Consequence: any planning-side
+prior that assumes the path to the goal is near the straight line is unsupported here. That kills
+the corridor, equally-spaced latent waypoints, and any chord-based trust region, all at once,
+for the price of one forward pass.
+
+#### What SURVIVES untouched
+
+The §22.2 diagnosis is unaffected — it rests on measurements, not on the chord assumption:
+- OL 74.67 vs MPC 88.67 on the same checkpoint (14 pts) still says the open-loop plan interior is
+  wrong and re-observation hides it.
+- `objective_fn_last` still scores only the terminal latent, leaving frames 1..H−1 unconstrained
+  under 100 Adam steps.
+- The predictor is still accurate on dataset actions (skill 0.09/0.05/0.04/0.04).
+
+Only my proposed *fix* died. The decisive test (`debug_dset_init`) has not run yet and does not
+depend on the corridor at all. **Run that next.**
+
+#### Method change going forward: measure the discrepancy, do not guess the statistic
+
+The corridor failed because I picked a path statistic a priori. `planning/gd.py` now logs
+`pathdev_init` / `pathdev_final` alongside `obj_init` / `obj_final`. With
+`debug_dset_init=true` the planner starts at `gt_actions`, so a single run yields, per task, the
+path statistic of a known-good plan (step 0) and of GD's converged plan (step 100). If they
+differ, that is measured evidence of where the planner leaves real behaviour; if they do not,
+that statistic is not the trust region and we look at another one. No statistic gets promoted to
+an objective term before it is shown to separate the two.
+
+### 22.11 Two command errors in the §22.9 instructions (both mine, both fixed here)
+
+1. **`plan.py` takes the RUN dir, not the ckpt root.** Verified in `plan.py`: if
+   `ckpt_base_path` starts with `/` it is used as `model_path` verbatim; otherwise it is
+   `ckpt_base_path/model_name/`. `reproduce_table1.py::run_plan` therefore passes
+   `ckpt_base_path=os.path.join(base, name)` — the full run dir. Correct form:
+   `ckpt_base_path=$PWD/<root>/test/<NAME> model_name=<NAME>`.
+2. **The ✗ (no-straightening) cell path was a guess.** `run_variant_tag` appends `_ep<N>` to
+   newer runs, so the on-disk name may not match the canonical Table-1 cell name. Locate it with
+   `find`, do not assume.
