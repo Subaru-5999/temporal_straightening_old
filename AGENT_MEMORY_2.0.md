@@ -2130,3 +2130,73 @@ checkpoint's eval seeds spanned 12 points. Every arm to date is n=1 training run
 claim is defensible until the baseline is run with 3 training seeds to establish σ_train. The
 correlation study above does not need it (it uses already-measured success numbers), but the
 eventual training arm does.
+
+### 23.8 The floor is now measurable WITHOUT privileged information (independent confirmation)
+
+| source | floor |
+|---|---|
+| `gt_actions` on the 50 eval tasks (privileged) | 0.031905 |
+| **validation trajectories, real recorded actions** (no privileged info) | **0.030868** |
+
+**Agreement to 3.3%**, from different task samples and different code paths (one via plan.py's
+env-generated goals, one via dataset frames in `diagnose_planning.py::objective_floor`). The
+noise-floor account therefore **no longer rests on `gt_actions`** — it is reportable, not merely
+diagnostic. Secondary check: `persist = 0.6835` versus the zero-action plan's `obj_init = 0.6052`
+from the planner, consistent within 13% (they are the same quantity up to normalized-vs-zero
+action).
+
+### 23.9 First correlation point: prediction CONFIRMED on the strongest contrast, but n=2
+
+| run | rel_floor | recorded OL | recorded MPC |
+|---|---|---|---|
+| `ms1-4_lam0.1-0_ep3` (matched baseline) | **0.0453** | 74.67 | 88.67 |
+| `roll4g0.9_ep3` (rollout) | **0.1373** | **56.00** | 62.00 |
+
+3.03× the relative floor, 18.67 points less open-loop success — the pre-registered direction.
+
+**Independent cross-check of the metric itself:** §20's `skill_4` (a different H, different
+weighting, different script) gave 0.0426 vs 0.1257 = **2.95×**, matching this 3.03× to within 3%.
+`rel_floor` and `skill_k` are measuring the same underlying quantity.
+
+**Do not overclaim this.** n=2, and the four remaining PushT checkpoints have OL in 68.67–76.67 —
+an 8-point band that is inside single-run noise — so their `rel_floor` will very likely cluster too.
+The cross-checkpoint "correlation" would then be a two-cluster comparison (normal models ≈0.045 /
+OL≈73 versus one broken model 0.137 / OL 56) driven entirely by one outlier, and confounded by
+loss, budget and training run varying together. Suggestive, not conclusive.
+
+### 23.10 The sharp test: PER-TASK, one checkpoint, no confounds
+
+Instead of correlating six checkpoints that differ in many ways, ask: within **one** model, one
+protocol and the **same 50 tasks**, does a task's own objective value predict whether that task
+succeeds? 50 paired observations, zero cross-checkpoint confound.
+
+Implemented:
+- `planning/gd.py` keeps the PER-TASK objective vectors (`self.last_probe_per_task`) instead of
+  only their means.
+- `planning/mpc.py` pairs them with the per-task outcome after the first MPC iteration and writes
+  `probe_per_task.json` into the run's output dir. Wrapped in try/except — diagnostics must never
+  break an eval.
+- `probe_planner.py` reports the **AUC** = P(a failed task scores higher than a succeeded one),
+  as a Mann-Whitney U statistic (no distributional assumption; these values have heavy tails).
+
+Unit-verified: perfect separation → 1.0, reversed → 0.0, all ties → 0.5, no failures → None.
+
+**Interpretation, fixed in advance:**
+- `AUC(obj_final) ≈ 0.5` → the converged objective value cannot distinguish a solved task from a
+  failed one. That is the noise-floor account confirmed at the per-task level, and it is a much
+  stronger statement than the cross-checkpoint correlation.
+- `AUC(obj_final)` clearly above 0.5 → the objective IS informative per task, the plateau has some
+  other cause, and the floor story is wrong. Report whichever occurs.
+- `AUC(obj_init)` under `--gt-init` at `opt_steps=0` is a bonus: it asks whether the model's error
+  on the TRUE plan predicts which tasks the planner will fail — i.e. whether per-task model
+  accuracy is what determines per-task planning success. That is the mechanism claim in its most
+  direct form.
+
+### 23.11 Corridor: fourth and final kill
+
+Re-ran on both checkpoints: separation 0.63 and 0.64 (need ≥1.5), real_p90 0.5912 and 0.5710
+(need ≤0.5). Both NO-GO. The mechanism check also fails to discriminate — the *rollout* run shows
+the marginally SMALLER real deviation (0.5710 vs 0.5912), the opposite of the straightening story.
+Combined with `pathdev` being flat between an exact plan and an exploited one (§23.1) and GD
+raising `pathdev` from 0.1932 toward the real-data value on its own (§23.7), **path geometry is
+conclusively not the failure mode.** Closed permanently.

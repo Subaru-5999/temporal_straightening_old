@@ -143,10 +143,57 @@ def run_probe(cfg_name, run_dir, name, steps, alpha, seed, gt_init, extra):
     if row["save_dir"]:
         for k, v in read_probe_logs(row["save_dir"]).items():
             row.setdefault(k, v)                     # logs.json: only if the sub-planner logs
+        d = read_per_task(row["save_dir"])
+        if d:
+            for key in ("obj_init", "obj_final"):
+                st = per_task_stats(d, key)
+                if st:
+                    row[f"pt_{key}"] = st
     print(f"   -> success={row['success']}"
           + (f"  obj {row['obj_init']:.6g} -> {row['obj_final']:.6g}"
              if "obj_init" in row else ""), flush=True)
     return row
+
+
+def read_per_task(save_dir):
+    """Per-task objective values paired with per-task outcomes (written by MPCPlanner)."""
+    p = Path(save_dir) / "probe_per_task.json"
+    if not p.is_file():
+        return None
+    try:
+        d = json.loads(p.read_text())
+    except Exception:
+        return None
+    if not d.get("obj_init") or not d.get("success"):
+        return None
+    return d
+
+
+def per_task_stats(d, key="obj_init"):
+    """Does a task's OWN objective value predict whether that task succeeds?
+
+    Reported as the AUC: the probability that a randomly chosen FAILED task has a higher
+    objective than a randomly chosen SUCCEEDED one. 0.5 = the objective carries no per-task
+    information about outcome; 1.0 = it ranks outcomes perfectly. Computed as the
+    Mann-Whitney U statistic, which needs no distributional assumption and is robust to the
+    heavy tails these values have.
+
+    This is the sharpest test of the noise-floor account, because it holds the checkpoint, the
+    protocol and the task set fixed -- unlike a cross-checkpoint correlation, where models differ
+    in loss, budget and training run all at once.
+    """
+    obj = d[key]
+    succ = d["success"]
+    s = [o for o, k in zip(obj, succ) if k]
+    f = [o for o, k in zip(obj, succ) if not k]
+    if not s or not f:
+        return None
+    wins = sum((1.0 if a > b else 0.5 if a == b else 0.0) for a in f for b in s)
+    return {
+        "n_success": len(s), "n_fail": len(f),
+        "mean_success": sum(s) / len(s), "mean_fail": sum(f) / len(f),
+        "auc": wins / (len(f) * len(s)),
+    }
 
 
 def report(rows, gt_init):
@@ -193,6 +240,30 @@ def report(rows, gt_init):
                   f"  success {r['success']:.2f}")
         print("If success is below the opt_steps=0 row, the true goal is not the argmin of the")
         print("latent cost. That is a property of the objective; no encoder regularizer fixes it.")
+
+    pt = [r for r in rows if "pt_obj_final" in r or "pt_obj_init" in r]
+    if pt:
+        print("\n" + "=" * 92)
+        print("PER-TASK: does a task's OWN objective value predict its outcome?")
+        print("=" * 92)
+        print("AUC = P(a failed task scores higher than a succeeded one). 0.50 = the objective")
+        print("carries NO per-task information about success. Same checkpoint, same protocol, same")
+        print("50 tasks -- no cross-checkpoint confound.\n")
+        head = (f"{'opt_steps':>10}{'which':>11}{'n_ok':>6}{'n_fail':>7}"
+                f"{'mean(ok)':>12}{'mean(fail)':>12}{'AUC':>8}")
+        print(head)
+        print("-" * len(head))
+        for r in rows:
+            for key in ("obj_init", "obj_final"):
+                st = r.get(f"pt_{key}")
+                if not st:
+                    continue
+                print(f"{r['steps']:>10}{key:>11}{st['n_success']:>6}{st['n_fail']:>7}"
+                      f"{st['mean_success']:>12.6f}{st['mean_fail']:>12.6f}{st['auc']:>8.3f}")
+        print("\nReading: AUC near 0.5 on obj_final means the converged objective value cannot tell")
+        print("a solved task from a failed one -- the noise-floor account, at the per-task level.")
+        print("AUC clearly above 0.5 would mean the objective IS informative per task and the")
+        print("plateau has some other cause. Report whichever it is.")
 
 
 def main():

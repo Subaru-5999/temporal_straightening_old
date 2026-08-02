@@ -157,10 +157,12 @@ class GDPlanner(BasePlanner):
         def _probe():
             with torch.no_grad():
                 zo, _ = self.wm.rollout(obs_0=trans_obs_0, act=actions)
-                return (self.objective_fn(zo, z_obs_g, step=step).mean().item(),
-                        corridor_penalty(zo, z_obs_g).sqrt().mean().item())
+                per_task = self.objective_fn(zo, z_obs_g, step=step)      # (n_evals,)
+                return (per_task.mean().item(),
+                        corridor_penalty(zo, z_obs_g).sqrt().mean().item(),
+                        per_task.detach().cpu().tolist())
 
-        obj_init, dev_init = _probe()
+        obj_init, dev_init, obj_init_per_task = _probe()
 
         for i in tqdm(range(self.opt_steps)):
             optimizer.zero_grad()
@@ -191,7 +193,15 @@ class GDPlanner(BasePlanner):
                 if np.all(successes):
                     break  # terminate planning if all success
 
-        obj_final, dev_final = _probe()
+        obj_final, dev_final, obj_final_per_task = _probe()
+        # PER-TASK vectors, kept for the strongest available test of the noise-floor mechanism:
+        # within ONE checkpoint and ONE protocol, does a task's own objective value predict whether
+        # that task succeeds? 50 paired observations, no cross-checkpoint confounds. MPCPlanner
+        # picks these up after its first evaluation and writes them next to the success array.
+        self.last_probe_per_task = {
+            "obj_init": obj_init_per_task,
+            "obj_final": obj_final_per_task,
+        }
         # PRINT as well as dump. MPCPlanner instantiates its sub-planner with
         # `log_filename=None` (see planning/mpc.py), and BasePlanner.dump_logs is a no-op in that
         # case -- so every config in this repo, all of which plan through MPCPlanner, silently

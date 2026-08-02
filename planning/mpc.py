@@ -134,6 +134,26 @@ class MPCPlanner(BasePlanner):
             )  # Update only for the newly successful trajectories
 
             print("self.is_success: ", self.is_success)
+            # Pair the sub-planner's PER-TASK objective values with the per-task outcome, once,
+            # on the first MPC iteration (for open-loop, max_iter=1, that is the whole run).
+            # This is the strongest test of the noise-floor mechanism available without training:
+            # one checkpoint, one protocol, 50 paired observations, no cross-checkpoint confound.
+            # Written to the run's output dir (plan.py has already chdir'd there).
+            probe = getattr(self.sub_planner, "last_probe_per_task", None)
+            if probe is not None and self.iter == 0:
+                try:
+                    import json as _json
+                    with open("probe_per_task.json", "w") as _f:
+                        _json.dump({
+                            "obj_init": probe["obj_init"],
+                            "obj_final": probe["obj_final"],
+                            "success": [bool(x) for x in successes],
+                            "state_dist": [float(x) for x in logs.get("state_dist", [])]
+                            if hasattr(logs.get("state_dist", []), "__iter__") else [],
+                        }, _f)
+                    print("[probe] wrote probe_per_task.json", flush=True)
+                except Exception as _e:      # diagnostics must never break an eval
+                    print(f"[probe] could not write probe_per_task.json: {_e}", flush=True)
             logs = {f"{self.logging_prefix}/{k}": v for k, v in logs.items()}
             logs.update({"step": self.iter + 1})
             self.wandb_run.log(logs)
