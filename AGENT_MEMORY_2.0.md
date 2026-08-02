@@ -1419,3 +1419,76 @@ init in a non-straightened run. Only point this at aggcos-trained checkpoints.
 ### 21.8 Status
 
 Implemented and unit-verified. **Gate not yet run on the pod.** No training launched.
+
+### 21.9 NOVELTY AUDIT (three layers checked; verdict: partially novel, honestly bounded)
+
+**Layer 1 — the paper itself: term is ABSENT.** Grepped both `sec/1_main.tex` and
+`sec/2_appendix.tex` for speed / arc-length / magnitude / norm. Velocity magnitude appears in
+exactly two places, and both are *assumptions*, never a loss:
+- `sec/1_main.tex` line 187, Remark `rem:cos_proxy`: "Under mild bounded-variation assumptions
+  on velocity magnitudes and smooth actions, a large cosine similarity implies that (A−I) is
+  small…" — the main text **admits** the proxy needs a velocity-magnitude condition.
+- `sec/2_appendix.tex` Assumption `as:app_cos_const`: the strict form, `||v_t|| = c` for all t.
+
+The appendix's rejected-loss list (`app:smooth_tc`) contains **smoothness** (penalises the
+magnitude `E||v_t||^2` → collapse) and **temporal contrastive** (InfoNCE) — neither is
+step-norm *uniformity*. So the paper states the condition, softens it in the main text, rejects
+a magnitude penalty for the wrong reason (collapse), and never enforces the ratio.
+
+**Layer 2 — the authors' original code: term is ABSENT.** Extracted
+`temporal_straightening_original.zip` and read `models/visual_world_model.py`. The velocity norm
+appears **only** as a masking threshold:
+```python
+step1 = v1.norm(dim=-1); step2 = v2.norm(dim=-1)
+mask = (step1 > step_thresh) & (step2 > step_thresh)   # drops stationary steps
+```
+The norm never enters the loss value. `total_curvature` returns `_cos_curvature(v1, v2)` and
+nothing else.
+
+**Layer 3 — outside literature: the ingredient has precedent, the derivation does not.**
+
+Closest prior art on a *straightening training objective*: **Niu, Savin & Simoncelli, "Learning
+predictable and robust neural representations by straightening image sequences"**
+([arXiv 2411.01777](https://arxiv.org/abs/2411.01777), NYU/Flatiron). Their `L_straightness` is
+the **identical** cosine form, and they state it is invariant to rescaling of responses. They
+**do** identify collapse — trivial solutions `z_t = c` and `z_t = c·t` — and fix it with
+VICReg-style variance + covariance whitening, **not** a speed term.
+- Note `z_t = c·t` is *constant-speed*, so the arc-length term would **not** catch it. Their fix
+  and this one are orthogonal, not competing. (This repo already exposes `training.vcreg`
+  std/cov coefficients, unused.)
+- Their Discussion proposes "enforce straightening at multiple time scales" as future work —
+  i.e. our multi-scale experiment (§10/§15/§18) is the thing that literature suggests, and it
+  did **not** survive iteration matching on PushT. Worth remembering before anyone re-proposes it.
+- Hénaff et al. curvature is the angle between successive difference vectors — pure angle, no
+  speed component.
+
+Concept-level precedent for a "constant speed loss" in a latent space: **"Uniform Interpolation
+Constrained Geodesic Learning on Data Manifold"**
+([arXiv 2002.04829](https://arxiv.org/abs/2002.04829)) introduces a constant-speed loss plus a
+minimizing-geodesic loss to make an *interpolation network* produce uniform interpolation along
+a learned geodesic. Different setting entirely (autoencoder latent interpolation for image
+translation, induced Riemannian metric; no video dynamics, no actions, no world model, no
+planning), and **v3 was withdrawn by the author** ("some experiments need to be modified").
+Adjacent but not the same: arc-length reparameterization is textbook differential geometry and
+standard in robot LfD trajectory alignment ([arXiv 2410.13322](https://arxiv.org/abs/2410.13322));
+rectified flow assumes straight, constant-velocity couplings by construction, and Constant
+Acceleration Flow ([arXiv 2411.00322](https://arxiv.org/abs/2411.00322)) relaxes that assumption
+— but those are prescribed generative-ODE paths, not a regularizer on observed latents.
+"Speed consistency" in video SSL ([arXiv 2106.02342](https://arxiv.org/abs/2106.02342)) is
+*playback-rate* similarity, unrelated.
+
+**Verdict.**
+- **Novel:** (a) the observation that this paper's cosine proxy rests on an assumption its own
+  loss cannot enforce; (b) the exact decomposition
+  `||v_{t+1}-v_t||^2/(||v_t|| ||v_{t+1}||) = (r+1/r-2) + 2(1-C)` used to *derive* the mixing
+  coefficient rather than tune it; (c) adding a step-norm-uniformity term to a straightening
+  regularizer at all, and doing it in a latent world model for planning. No source found that
+  does any of these.
+- **Not novel:** the bare idea of penalising non-uniform speed in a latent space (2002.04829,
+  withdrawn; arc-length reparameterization generally).
+- **Honest framing:** this is a targeted fix to a stated-but-unenforced assumption in one
+  published method, with a derived coefficient and a verified no-collapse property — not a new
+  research paradigm. Its value is empirical and rests entirely on §21.6's gate.
+
+*Sources above were paraphrased and summarised; content was rephrased for compliance with
+licensing restrictions.*
