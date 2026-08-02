@@ -116,6 +116,22 @@ def arc_tag(straighten_speed_lambda=0.0) -> str:
     return f"_arc{_fmt_num(l)}"
 
 
+def corridor_tag(corridor_beta=0.0, corridor_rho=0.0) -> str:
+    """Suffix encoding the latent-geodesic-corridor planning objective, so corridor evals land in
+    their OWN plan_outputs folder and can never be mixed with the paper-faithful numbers.
+    Returns '' for beta<=0 (the paper default), keeping baseline output paths byte-identical.
+
+    Example: (beta=0.5, rho=0.2) -> "_cor0.5r0.2";  (beta=0.5, rho=0) -> "_cor0.5"
+    """
+    b = _scalar_or_none(corridor_beta)
+    b = float(b) if b is not None else 0.0
+    if b <= 0:
+        return ""
+    r = _scalar_or_none(corridor_rho)
+    r = float(r) if r is not None else 0.0
+    return f"_cor{_fmt_num(b)}" + (f"r{_fmt_num(r)}" if r > 0 else "")
+
+
 def run_variant_tag(epochs, seed=0) -> str:
     """Suffix encoding training length (and non-zero training seed) so runs at different
     epoch counts / seeds land in their OWN folders (planning outputs inherit it via model_name).
@@ -140,6 +156,7 @@ OmegaConf.register_new_resolver("straighten_tag", straighten_tag)
 OmegaConf.register_new_resolver("rollout_tag", rollout_tag)
 OmegaConf.register_new_resolver("iso_tag", iso_tag)
 OmegaConf.register_new_resolver("arc_tag", arc_tag)
+OmegaConf.register_new_resolver("corridor_tag", corridor_tag)
 OmegaConf.register_new_resolver("run_variant_tag", run_variant_tag)
 
 if __name__ == "__main__":

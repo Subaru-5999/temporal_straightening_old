@@ -5,9 +5,9 @@ defaults:
 
 hydra:
   run:
-    dir: plan_outputs_gd_mpc/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}_init${planner.sub_planner.sample_type}
+    dir: plan_outputs_gd_mpc/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}${corridor_tag:${objective.corridor_beta},${objective.corridor_rho}}_init${planner.sub_planner.sample_type}
   sweep:
-    dir: plan_outputs_gd_mpc/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}_init${planner.sub_planner.sample_type}
+    dir: plan_outputs_gd_mpc/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}${corridor_tag:${objective.corridor_beta},${objective.corridor_rho}}_init${planner.sub_planner.sample_type}
     subdir: ${hydra.job.num}
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
@@ -37,6 +37,12 @@ objective:
   alpha: 0
   base: 2 
   mode: all
+  # LATENT GEODESIC CORRIDOR (NOVEL; 0.0 = paper exactly). See conf/plan_gd.yaml and
+  # planning/objectives.py::corridor_penalty. Note MPC re-observes every step, so it is already
+  # partially protected against a wrong plan interior -- the open-loop setting is where this
+  # term should matter most, and that asymmetry is itself a testable prediction.
+  corridor_beta: 0.0
+  corridor_rho: 0.0
 
 planner:
   _target_: planning.mpc.MPCPlanner

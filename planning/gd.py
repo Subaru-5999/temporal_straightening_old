@@ -140,6 +140,15 @@ class GDPlanner(BasePlanner):
         scheduler = self.get_scheduler(optimizer)
         n_evals = actions.shape[0]
 
+        # Objective value at the FIRST and LAST optimizer step, recorded per eval.
+        # WHY: with `debug_dset_init=true` the planner is initialised AT the ground-truth action
+        # sequence -- a plan that reaches the goal by construction. `obj_init` is then the model's
+        # own cost for a KNOWN-GOOD plan, and `obj_final` the cost of whatever GD converged to.
+        # obj_final < obj_init while success DROPS is direct evidence that minimising this
+        # objective moves away from the task solution, i.e. the objective is misspecified rather
+        # than merely hard to optimise. Diagnostic only; costs nothing and changes no gradient.
+        obj_init = obj_final = None
+
         for i in tqdm(range(self.opt_steps)):
             optimizer.zero_grad()
             i_z_obses, i_zs = self.wm.rollout(
@@ -147,6 +156,9 @@ class GDPlanner(BasePlanner):
                 act=actions,
             )
             loss = self.objective_fn(i_z_obses, z_obs_g, step=step)  # (n_evals, )
+            if i == 0:
+                obj_init = loss.detach().mean().item()
+            obj_final = loss.detach().mean().item()
             total_loss = loss.mean() * n_evals  # loss for each eval is independent
             total_loss.backward()
             optimizer.step()
@@ -168,4 +180,11 @@ class GDPlanner(BasePlanner):
                 self.dump_logs(logs)
                 if np.all(successes):
                     break  # terminate planning if all success
+
+        if obj_init is not None:
+            self.dump_logs({
+                f"{self.logging_prefix}/obj_init": obj_init,
+                f"{self.logging_prefix}/obj_final": obj_final,
+                f"{self.logging_prefix}/obj_reduction": obj_init - obj_final,
+            })
         return actions, np.full(n_evals, np.inf)  # all actions are valid

@@ -5,9 +5,9 @@ defaults:
 
 hydra:
   run:
-    dir: plan_outputs_gd/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}_init${planner.sub_planner.sample_type}
+    dir: plan_outputs_gd/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}${corridor_tag:${objective.corridor_beta},${objective.corridor_rho}}_init${planner.sub_planner.sample_type}
   sweep:
-    dir: plan_outputs_gd/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}_init${planner.sub_planner.sample_type}
+    dir: plan_outputs_gd/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}${corridor_tag:${objective.corridor_beta},${objective.corridor_rho}}_init${planner.sub_planner.sample_type}
     subdir: ${hydra.job.num}
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
@@ -41,6 +41,17 @@ objective:
   alpha: 0
   base: 2 
   mode: last
+  # LATENT GEODESIC CORRIDOR (NOVEL; 0.0 = paper exactly, same function object, no wrapper).
+  # Charges the PREDICTED latent path for bowing SIDEWAYS off the straight segment z_0 -> z_g,
+  # while leaving progress ALONG the segment free. `mode=last` constrains only the endpoint, so
+  # the interior of the plan is unconstrained and a 100-step Adam optimiser is free to find
+  # action sequences the model wrongly believes reach the goal. See planning/objectives.py
+  # ::corridor_penalty for the derivation and for why this is NOT `mode=all`.
+  # Requires NO retraining -- it runs on existing checkpoints.
+  corridor_beta: 0.0
+  # Dead zone on the normalised sideways deviation. MEASURE it from real dataset segments
+  # (diagnose_planning.py --corridor-stats) rather than tuning it against success.
+  corridor_rho: 0.0
 
 planner:
   _target_: planning.mpc.MPCPlanner

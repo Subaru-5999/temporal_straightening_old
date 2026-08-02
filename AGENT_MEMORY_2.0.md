@@ -1492,3 +1492,153 @@ Acceleration Flow ([arXiv 2411.00322](https://arxiv.org/abs/2411.00322)) relaxes
 
 *Sources above were paraphrased and summarised; content was rephrased for compliance with
 licensing restrictions.*
+
+---
+
+## 22. THE STRONGEST DIRECTION — stop regularizing the encoder, fix the PLANNING OBJECTIVE
+
+This supersedes §21 as the priority route. §21 (arc-length) stays implemented and gated, but it
+is the fifth member of a family that has now produced four ties-or-losses, and §22 is a
+different surface entirely — with a decisive test that needs **zero training**.
+
+### 22.1 The pattern nobody had named
+
+| # | extension | surface touched | matched result on PushT |
+|---|---|---|---|
+| §10/§15 | multi-scale straightening | encoder representation | tie (+2 OL / −0.7 MPC) |
+| §18 | dense 4-scale | encoder representation | −6 / −6 |
+| §20 | rollout consistency | predictor training | **−18.7 / −26.7** |
+| §21.5 | action isometry | predictor/action Jacobian | never ran; buggy |
+| §21 | arc-length | encoder representation | pending gate |
+
+**Every extension so far has tried to make the learned representation better.** Four attempts,
+zero wins. The paper already found the good operating point for encoder regularization, and
+additional pressure either does nothing or crowds out `z_loss`. Meanwhile **the planning
+objective has never been touched** — and it is where the paper itself points (§21.9: "planning
+objectives do not necessarily operate in the prediction latent space").
+
+### 22.2 The measured fact that has been sitting unused
+
+**Open-loop 74.67 vs MPC 88.67 on the identical checkpoint.** A 14-point gap, far above the
+~11.5 pp detection floor. MPC changes nothing about the model; it only re-observes every model
+step. So the gap is not a representation deficiency at all — it says the open-loop **plan
+interior is wrong**, and re-observing papers over it.
+
+Cross-check from §20's diagnostic: on real dataset actions the predictor is very accurate
+(skill vs persistence 0.09 / 0.05 / 0.04 / 0.04 at k=1..4). The model is *not* generally bad at
+4-step prediction. It is bad on the specific actions the **planner** invents.
+
+Read `planning/objectives.py::objective_fn_last` (verified, this is the open-loop PushT cost):
+```python
+loss_visual = metric(z_obs_pred["visual"][:, -1:], z_obs_tgt["visual"]).mean(...)
+```
+Only the TERMINAL predicted latent is scored. Frames 1..H−1 are **completely unconstrained**.
+Then 100 Adam steps run against a differentiable world model. That is a strong optimizer with an
+unconstrained interior: the textbook setup for finding the model's adversarial minima — action
+sequences the model confidently believes reach the goal and which fail in the real environment.
+Independent framing of the same asymmetry: pushing a latent off its natural-future manifold is
+easy, steering it to an on-manifold target is hard
+([arXiv 2606.22966](https://arxiv.org/abs/2606.22966)).
+
+### 22.3 The method — LATENT GEODESIC CORRIDOR (LGC)
+
+Charge the predicted latent path for bowing **sideways** off the straight segment z_0 → z_g,
+leaving progress **along** it free. With u = z_g − z_0 and d_k = ẑ_k − z_0:
+
+```
+along_k = (<d_k,u>/||u||^2) u ;  perp_k = d_k − along_k ;  dev_k = ||perp_k|| / ||u||
+J = ||ẑ_H − z_g||^2 + alpha*proprio  +  beta * mean_k [ max(0, dev_k − rho) ]^2
+```
+
+Three regimes, and the middle one is why this is not already in the paper:
+
+| objective | constrains | failure |
+|---|---|---|
+| `mode=last` (paper OL) | endpoint only | interior free → exploitable |
+| `mode=all` (paper MPC) | every frame toward the **goal** | demands premature arrival — a *wrong* prior |
+| **corridor (new)** | every frame toward the **line**, free along it | removes exactly the degeneracy, adds no schedule opinion |
+
+Why the perpendicular/along split is essential: latent speed is **not** uniform (that is what
+§21 measures), so any objective that fixes the progress schedule — `mode=all`, or equally-spaced
+waypoints — fights the dynamics. Charging only the perpendicular component makes the term
+invariant to the progress rate by construction.
+
+Why this is the paper's own prior: straightening trains real latent paths to be locally straight
+and the PCA/heatmap analyses argue Euclidean ≈ geodesic. If both hold, the real path from z_0 to
+z_g is close to the straight segment, so a plan that bows far off it is off-manifold — the
+signature of extrapolation. **It is a trust region expressed in the geometry the paper spent its
+entire training budget building.**
+
+`rho` is a dead zone, **measured not tuned**: real trajectories are not perfectly straight
+either, so set rho to a high quantile of the deviation real dataset segments exhibit
+(`diagnose_planning.py` prints it). Inside the envelope of real behaviour the term charges
+nothing.
+
+### 22.4 Why this beats every previous candidate on cost
+
+**It requires no retraining.** It is a planning-objective change evaluated on the checkpoints
+that already exist. Every prior idea cost 20–40 h of training before it could be falsified;
+this costs one eval sweep. `wm.rollout` already returns every intermediate latent and
+`objective_fn_all` already consumes them, so there is not even an extra forward pass.
+
+### 22.5 Verified properties (float64 unit tests, all passed)
+
+| claim | measured |
+|---|---|
+| `corridor_beta=0` leaves the paper path unwrapped | returned fn is `objective_fn_last`, values identical |
+| zero on a straight path with **random, non-uniform** progress | 1.8e-32 |
+| scale-free under z → a·z (a = 0.01, 7, 1000) | 1.1e-16 |
+| distinct from `mode=all` | `all` charges 0.0711 on that same straight path; corridor 8.8e-33 |
+| dead zone switches it off | rho=10 → exactly 0.0 |
+| gradient reaches interior only | per-frame grad [0, .037, .037, .036, .037, 0] — start and terminal exactly 0 |
+
+### 22.6 GO/NO-GO gate — `diagnose_planning.py` (forward-only, minutes, no labels)
+
+Measured on the PLANNING representation (`z_obs["visual"]`, not the agg head), so it is valid for
+straightened and non-straightened checkpoints alike, over the exact 25-env-step window the
+Table-1 protocol plans across.
+- `real_dev_*`: deviation of real interior latents from the real start→goal segment.
+- `mismatch_dev_*`: control condition, goal swapped to a different trajectory.
+- `separation = mismatch_p50 / real_p90`.
+
+Pre-registered: **GO iff separation ≥ 1.5 and real_p90 ≤ 0.5.** Otherwise real latent paths
+wander as much as unrelated ones, the straight-segment prior is false in this space, and the
+term would only add bias. Secondary **mechanism test** (both checkpoints exist): the
+straightened run should show smaller `real_dev` and larger `separation` than the
+no-straightening run. If the ordering reverses, report it — the story is wrong even if the gate
+passes.
+
+### 22.7 The other decisive diagnostic, which needs NO new code at all
+
+`plan.py` already has `debug_dset_init`, which initialises the planner **at `gt_actions`** — the
+dataset's own action sequence for that segment, which reaches the goal by construction. So:
+
+run the existing eval twice, `debug_dset_init=False` then `=True`, and compare.
+- gt-init success **≫** zero-init → the good basin exists and zero-init misses it → the fix is
+  initialisation / multi-start with argmin-by-model-cost selection (still no privileged info,
+  still no training).
+- gt-init success **≈** zero-init → GD converges to the same place regardless of start → the
+  objective, not the optimizer, is the bottleneck → LGC.
+- gt-init success **below** the gt actions' own (~100%) success → **minimising the latent
+  objective actively destroys a working plan.** Decisive evidence of misspecification.
+
+`planning/gd.py` now records `obj_init` / `obj_final` / `obj_reduction` per planning call, so
+with `debug_dset_init=true` the log directly shows whether GD found a **lower** model cost than
+a known-good plan. `obj_final < obj_init` while success drops is the smoking gun, and it is
+one flag and two eval runs away.
+
+`gt_actions` is privileged information: valid for **diagnosis only**, never inside the method.
+
+### 22.8 Files changed
+
+- `planning/objectives.py` — `corridor_penalty`, and `create_objective_fn(corridor_beta,
+  corridor_rho)` wrapping any mode. `beta=0` returns the base fn unwrapped.
+- `planning/gd.py` — `obj_init`/`obj_final`/`obj_reduction` logging.
+- `conf/plan_gd.yaml`, `conf/plan_gd_mpc.yaml` — `objective.corridor_beta/_rho` (0.0 default).
+- `custom_resolvers.py` — `corridor_tag` ⇒ `_cor0.5r0.2` in the plan-output dir; `''` at 0 so
+  baseline output paths stay byte-identical and results can never mix.
+- `diagnose_planning.py` — the gate.
+
+### 22.9 Status
+
+Implemented and unit-verified. Gate not yet run. No training required at any point.
