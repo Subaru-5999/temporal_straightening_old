@@ -1198,3 +1198,95 @@ Do NOT launch a retry before this measurement. Section 19.5 lesson: instrument f
 Straightening window 7 frames (5 triplets) vs baseline 4 frames (2 triplets) -- unlikely to
 account for effects this large (the 9-frame multi-scale run TIED) but not formally excluded.
 `has_decoder=false` shifts the dropout RNG stream; nuisance-level only.
+
+### 20.19 DIAGNOSTIC RESULT — route CLOSED, and the loss failed at its OWN objective
+
+`diagnose_rollout.py` (commit f531db0), validation split, FIXED 7-frame window for both
+checkpoints, forward-only. Row 1 = baseline `_ms1-4_lam0.1-0_ep3`, row 2 = `_roll4g0.9_ep3`.
+
+**(A) Shape of the error curve -- normalised to k=1 (scale-invariant, so comparable):**
+
+| Run | k1 | k2 | k3 | k4 | fitted |
+|---|---|---|---|---|---|
+| Baseline | 1.000 | 1.451 | 1.924 | 2.483 | `k^0.66` |
+| Rollout K=4 | 1.000 | 1.421 | 1.778 | 2.220 | `k^0.58` |
+
+**PREMISE REFUTED.** The BASELINE curve is already sub-linear (`k^0.66` vs the `1/2/3/4` that
+independent errors at unit gain would give, and far from geometric). There was no amplification to
+remove. The loss did flatten the shape a little (0.66 -> 0.58), so it was not inert -- there was
+simply nothing to win. This is branch (a) of the section 20.16 decision rule: **CLOSE, no retry.**
+
+**(B) Scale-free accuracy -- `skill_k = rollout_err_k / persist_err_k`, persistence = hold the last
+real history frame. Dimensionless; <1 beats doing nothing.**
+
+| Run | z_rms | skill_k1 | skill_k2 | skill_k3 | skill_k4 |
+|---|---|---|---|---|---|
+| Baseline | 0.9175 | 0.0904 | 0.0516 | 0.0438 | 0.0426 |
+| Rollout K=4 | 0.8457 | 0.2651 | 0.1627 | 0.1331 | 0.1257 |
+| ratio (roll/base) | | **2.93x** | **3.15x** | **3.04x** | **2.95x** |
+
+**The rollout model predicts ~3x WORSE at EVERY k -- including k=2,3,4, the horizons the loss
+explicitly optimised.** Both still beat persistence comfortably (0.13 and 0.04 << 1), so both are
+useful predictors; the baseline is simply 3x better.
+
+The raw-MSE gap was NOT latent rescaling. z_rms went DOWN (0.9175 -> 0.8457), which by itself would
+make MSE smaller, yet the error is ~2x larger in raw terms. Two independent normalisations agree:
+  - skill vs persistence: 2.9-3.2x worse
+  - error / z_rms^2: baseline 0.004485/0.8418 = 0.00533 vs rollout 0.008849/0.7152 = 0.01237 -> **2.32x worse**
+
+**(C) The latent became LESS MOBILE per step -- direct support for the contraction story (20.12).**
+Recovering the persistence error (`rollout_err_k1 / skill_k1`) and normalising by latent scale:
+
+| Run | persist_err_k1 | / z_rms^2 |
+|---|---|---|
+| Baseline | 0.04961 | 0.0589 |
+| Rollout K=4 | 0.03338 | **0.0467  (79% of baseline)** |
+
+Consecutive REAL latents sit ~21% closer together, relative to the representation's own scale. This
+is a property of the ENCODER, not the predictor: the encoder learned a representation in which
+adjacent frames are less distinguishable. That is precisely the temporal-contrast collapse direction
+`stop_grad=True` exists to prevent, and it degrades planning directly -- the objective
+`|z_H - z_goal|` becomes less discriminative, so GD has a flatter, less informative landscape.
+
+Note this is measured on real encoded frames, so it is about encoder temporal contrast; it is NOT
+the same quantity as `dz_H/da` (predictor Jacobian). Both could be degraded. `dz_H/da` remains
+unmeasured.
+
+**(D) Curvature at a COMMON window -- the window confound is largely defused:**
+baseline 0.243656, rollout 0.232809. Near-identical, and cosine is scale-invariant so this comparison
+is valid. The widened 7-frame straightening window did NOT change the geometry the model actually
+achieved, so it is unlikely to be carrying the -18.67 / -26.67.
+
+### 20.20 Why "just re-weight it" is NOT a way out
+
+Section 20.11 showed the term was ~3.7x `z_loss`, so over-weighting explains the SIZE of the harm:
+it crowded out one-step prediction (skill_k1 3x worse), and since multi-step error is built on
+one-step error, k=2,3,4 degraded too. A pure optimisation failure, not redundancy.
+
+But a correctly-weighted version has no upside to chase: (A) shows the baseline already has no
+amplification. The best case for `lambda -> 0` is convergence back to the baseline. **Not worth 41 h
+of training.** Both facts are needed -- (B)/(C) explain the magnitude, (A) explains why fixing the
+magnitude buys nothing.
+
+### 20.21 ROUTE CLOSED. What to report, and where to go next
+
+Report (all iteration-matched at 141,996 steps, PushT, 3 data seeds, 50 tasks):
+1. Adding multi-step rollout consistency to a DINO-WM-style latent world model cost
+   **-18.67 pp open-loop and -26.67 pp MPC** (z ~ 3.7-3.8).
+2. It did not even achieve its own objective: **~3x worse multi-step prediction** at the very
+   horizons it optimised, by two independent scale-free measures.
+3. The reason: latent one-step error compounds only **sub-linearly** (`k^0.66`) along
+   in-distribution trajectories in the untreated model. The exposure-bias premise that motivates
+   multi-step losses in sequence modelling does not transfer to this setting.
+4. Mechanism, measured: the encoder's **temporal contrast collapsed ~21%** (adjacent latents moved
+   closer relative to scale), flattening the planning objective. An unusually SMALL MPC-over-open-loop
+   gain (1.107 vs 1.15-1.71 for every other run) is the signature of optimiser/landscape failure
+   rather than prediction failure.
+
+Next direction, and it is now better motivated than before: section 8 of
+`STUDY_PACKAGE/03_PROJECT_LATEST_MATH_AND_CODE.md` -- the **action-isometry** term targeting
+`kappa(B)` for `B = dz_{t+1}/da_t`. Two independent lines now point at the action->latent map and the
+discriminativeness of the latent as the binding constraint, not rollout fidelity. BEFORE writing any
+new loss, MEASURE `dz_H/da` (norm + conditioning) across the existing 5 checkpoints and check it
+correlates with the success rates we already have. That is a few hours, uses runs already on disk,
+and would be the first predictive check this project has done rather than a post-hoc story.
