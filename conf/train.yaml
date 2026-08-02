@@ -15,9 +15,9 @@ ckpt_base_path: ./checkpoints
 
 hydra:
   run:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${rollout_tag:${training.rollout_steps},${training.rollout_gamma}}${iso_tag:${training.iso_lambda}}${run_variant_tag:${training.epochs},${training.seed}}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${rollout_tag:${training.rollout_steps},${training.rollout_gamma}}${iso_tag:${training.iso_lambda}}${arc_tag:${training.straighten_speed_lambda}}${run_variant_tag:${training.epochs},${training.seed}}
   sweep:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${rollout_tag:${training.rollout_steps},${training.rollout_gamma}}${iso_tag:${training.iso_lambda}}${run_variant_tag:${training.epochs},${training.seed}}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${straighten_tag:${training.straighten_scales},${training.straighten_lambdas},${training.straighten_scale_weights}}${rollout_tag:${training.rollout_steps},${training.rollout_gamma}}${iso_tag:${training.iso_lambda}}${arc_tag:${training.straighten_speed_lambda}}${run_variant_tag:${training.epochs},${training.seed}}
     subdir: ${hydra.job.num}
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
@@ -60,6 +60,30 @@ training:
   #     (aggcos1e-1 -> 0.1); effective coefficient = 0.1 * w_s. null = all 1.0.
   straighten_scale_weights: null
   straighten_goal_weight: 0.0      # mu>0 adds the directional term (pseudo-goal = window's last frame)
+  # ---- Arc-length / constant-speed consistency (NOVEL extension; 0.0 = paper exactly) -------
+  # WHY: the paper's cosine curvature is scale-invariant in each argument, so it constrains the
+  # DIRECTION of the latent velocity and nothing else. But the appendix proposition that licenses
+  # the cosine proxy (Assumption "Constant velocity and smooth actions") ASSUMES ||v_t|| = c for
+  # all t, and uses it exactly once -- to rewrite ||v_{t+1}-v_t||^2 as 2c^2(1-C_t). Redoing that
+  # step WITHOUT the assumption, with r_t = ||v_{t+1}||/||v_t||, gives the exact identity
+  #     ||v_{t+1}-v_t||^2 / (||v_t|| ||v_{t+1}||)  =  (r_t + 1/r_t - 2)  +  2 (1 - C_t)
+  # so the paper's curvature term is only HALF of the quantity its own bound needs. The other
+  # half is the speed-mismatch term added here. Driving C_t -> 1 leaves a residual |r_t - 1| in
+  # eps = ||A - I||, and eps enters the conditioning bound as ((1+eps)/(1-eps))^(2(H-1)) --
+  # amplified exponentially in the horizon. So this is a floor on exactly the quantity
+  # straightening exists to shrink.
+  # DERIVED, NOT TUNED: the 1:2 ratio in the identity fixes the matched coefficient at HALF the
+  # curvature lambda. Paper lambda_curv = 0.1  ->  straighten_speed_lambda = 0.05.
+  # NOT the rejected smoothness loss (App. "Comparison to Smoothness..."): that one penalises
+  # ||z_{t+1}-z_t||^2, i.e. the magnitude, and collapses states. This one is a function of the
+  # RATIO only, so under z -> a*z it is EXACTLY constant: no radial gradient, so latent collapse
+  # (the rollout-consistency failure mode, -19 to -27 points) cannot reduce it.
+  # FREE: reuses the velocities the curvature term already forms. No extra forward pass, NO window
+  # widening -> iterations/epoch, data window and straightening window stay bit-identical to the
+  # baseline, so no max_train_steps correction is needed to iteration-match.
+  # The raw per-scale value is logged as `speed_s<S>` even when this is 0, so baseline runs
+  # measure their own speed dispersion for free.
+  straighten_speed_lambda: 0.0
   # ---- Multi-step rollout-consistency loss (NOVEL extension; 1 = paper exactly) ------------
   # WHY: the predictor is TRAINED one step ahead with teacher forcing (every input is a real
   # encoded frame) but USED autoregressively for H steps at planning time, consuming its own

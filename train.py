@@ -464,6 +464,7 @@ class Trainer:
             straighten_scale_weights=self.cfg.training.get("straighten_scale_weights", None),
             straighten_goal_weight=self.cfg.training.get("straighten_goal_weight", 0.0),
             straighten_lambdas=self.cfg.training.get("straighten_lambdas", None),
+            straighten_speed_lambda=self.cfg.training.get("straighten_speed_lambda", 0.0),
             rollout_steps=self.cfg.training.get("rollout_steps", 1),
             rollout_gamma=self.cfg.training.get("rollout_gamma", 0.9),
             rollout_batch_frac=self.cfg.training.get("rollout_batch_frac", 1.0),

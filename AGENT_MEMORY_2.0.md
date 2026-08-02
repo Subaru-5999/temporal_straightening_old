@@ -1290,3 +1290,132 @@ discriminativeness of the latent as the binding constraint, not rollout fidelity
 new loss, MEASURE `dz_H/da` (norm + conditioning) across the existing 5 checkpoints and check it
 correlates with the success rates we already have. That is a few hours, uses runs already on disk,
 and would be the first predictive check this project has done rather than a post-hoc story.
+
+---
+
+## 21. NEW DIRECTION — arc-length (constant-speed) consistency: closing a gap in the paper's OWN proof
+
+Replaces both rollout-consistency (CLOSED, §20, −18.7 OL / −26.7 MPC) and action-isometry
+(never launched; see §21.5 for the bug that made it unrunnable) as the active route.
+
+### 21.1 The gap (this is the whole idea)
+
+`sec/2_appendix.tex`, Assumption `as:app_cos_const` ("Constant velocity and smooth actions")
+assumes `||v_t||_2 = c` **for all t**, and Proposition `prop:app_cos` uses that assumption
+**exactly once** — to turn a norm into a cosine:
+
+```
+||v_{t+1} - v_t||^2 = ||v_t||^2 + ||v_{t+1}||^2 - 2||v_t|| ||v_{t+1}|| C_t
+                    = 2 c^2 (1 - C_t)             <-- ONLY if ||v_{t+1}|| = ||v_t|| = c
+```
+
+**Nothing in the deployed loss enforces that assumption.** `F.cosine_similarity` is invariant
+to the length of each argument, so the curvature term never sees `||v_t||`. Verified in code:
+`models/visual_world_model.py::_cos_curvature` / `_scale_velocity_curvature`.
+
+Redo the same algebra **without** the assumption, with `r_t = ||v_{t+1}|| / ||v_t||`:
+
+```
+||v_{t+1} - v_t||^2 / (||v_t|| ||v_{t+1}||)  =  (r_t + 1/r_t - 2)  +  2 (1 - C_t)
+                                                \__ speed half __/   \_ direction _/
+```
+
+This identity is **exact** (verified numerically to 8.9e-16, float64). The paper's curvature
+term is only the **second half** of the quantity its own bound needs. The honest,
+assumption-free version of Eq. `app_dir_point_const` is
+
+```
+||(A - I) v_hat_t||  <=  sqrt( (r_t - 1)^2 + 2 r_t (1 - C_t) )  +  sigma_max(B) * Delta_a / ||v_t||
+```
+
+(set `r_t = 1` to recover the paper's line verbatim).
+
+**Consequence.** Driving the cosine term to its optimum, `C_t -> 1`, does **not** drive the
+residual to zero — `|r_t - 1|` survives. And `eps = ||A - I||` enters the conditioning bound as
+`((1+eps)/(1-eps))^(2(H-1))`, i.e. amplified **exponentially in the horizon**. Speed mismatch is
+therefore an un-attacked floor on **exactly** the quantity straightening exists to shrink.
+
+### 21.2 The term, and why the coefficient is DERIVED not tuned
+
+```
+L_speed^(s) = mean_t [ r_t + 1/r_t - 2 ],    r_t = ||v_{t+s}^(s)|| / ||v_t^(s)||
+```
+
+`r + 1/r - 2 = (sqrt(r) - 1/sqrt(r))^2 >= 0`, zero iff `r = 1`. The `r + 1/r` form (not
+`(r-1)^2`) is symmetric under `r -> 1/r`, so speeding up and slowing down cost the same;
+`(r-1)^2` charges `r=2` four times what it charges `r=1/2` and would bias toward deceleration,
+i.e. back toward collapse.
+
+The identity's **1 : 2** ratio fixes the mixing constant. With the paper's `lambda_curv = 0.1`,
+the matched value is **`straighten_speed_lambda = 0.05`**. No coefficient search.
+
+### 21.3 Why this is NOT the smoothness loss the paper rejected
+
+App. `app:smooth_tc` rejected `L_smooth = E||z_{t+1} - z_t||^2`: it penalises the **magnitude**
+of motion, so it is minimised by collapsing distinct states — which the paper observed. The new
+term is a function of the **ratio only**, so under a global rescale `z -> a*z` every `r_t` is
+unchanged. Measured (float64):
+
+| quantity | `d/da` at `a = 1` |
+|---|---|
+| arc-length term | **1.3e-08**  (i.e. exactly zero, no radial gradient) |
+| rejected smoothness loss | **59.76** (pulls the latent to zero) |
+
+Latent collapse — the documented rollout failure mode (§20: encoder temporal mobility −21%,
+planning −19 to −27 points) — **cannot reduce this loss**. Also verified: the term is exactly
+0.0 on a synthetic unit-speed trajectory, and exactly invariant under `z -> 0.5z / 100z`.
+
+### 21.4 Cost: this is the first extension where the loss term is the ONLY change
+
+- **No extra forward pass** — reuses the velocities the curvature term already builds.
+- **No window widening** — needs the same `2s+1` frames as the curvature at the same scale.
+  So iterations/epoch, the data pipeline and the straightening window are bit-identical to
+  the baseline: **no `max_train_steps` correction needed** to iteration-match (unlike
+  multi-scale §14 and rollout §20).
+- **No OOM risk** — no composed autograd graph (unlike rollout), no probe calls (unlike iso).
+
+### 21.5 Bug fix carried in the same commit: action-isometry radial gradient
+
+`action_isometry_loss` normalised by a **detached** `c`. The forward value is invariant to
+`B -> a*B`, but the gradient is not: `N` is homogeneous of degree 4, so
+`B . grad(N/c^2) = 4N/c^2 = 4L > 0` whenever `L > 0` — descent had a strictly inward radial
+component, so the term **was** satisfiable by shrinking `B`, the exact collapse shortcut its
+own docstring claimed it forbade. Measured `d/d(scale)`: **+2.98** with `c` detached,
+**−4.3e-16** with `c` differentiable. Fixed by keeping `c` in the graph (Euler: degree-0
+homogeneous ⇒ zero radial gradient). The old unit test compared only forward **values** under
+rescaling, which is why it passed. `iso_lambda` stays `0.0`; the objective is still not
+recommended (rectangular `B` on PushT, upper bound only, Adam already preconditions
+per-coordinate).
+
+### 21.6 GO/NO-GO gate — `diagnose_straightness.py` (forward-only, minutes, NO training)
+
+Pre-registered **before** looking at numbers, on the existing matched baseline checkpoint:
+
+- **GO** iff `speed_share = speed_half / (speed_half + direction_half) >= 0.15` at `s = 1`.
+- **NO-GO** otherwise: `r_t` is already ≈ 1, the paper's assumption holds in practice, and the
+  term is a no-op. Do **not** spend 20 h.
+
+Also reported: `eps_now`, `eps_if_straight` (what survives at `C_t -> 1`), `eps_if_const_speed`,
+`rms log r`, and whether `eps < 1` at all. If `eps >= 1` the appendix's exponential
+specialization is **vacuous** at these curvature levels — the identity stays exact, but the
+conditioning bound is then design guidance, not proof about success rate. Report either way.
+
+Caveat inherited from `diagnose_rollout.py`: `aggcos` measures `encoder.agg`, which is at random
+init in a non-straightened run. Only point this at aggcos-trained checkpoints.
+
+### 21.7 Files changed
+
+- `models/visual_world_model.py` — `_scale_speed_consistency` (derivation in the docstring);
+  accumulated in `total_curvature` as `speed_total`, added in `forward()` with an **absolute**
+  lambda (folding it into `total` would silently multiply it by the legacy global scale 0.1);
+  `speed_s<S>` logged **always**, so baseline runs measure their own dispersion for free;
+  `action_isometry_loss` normaliser fix.
+- `conf/train.yaml` — `training.straighten_speed_lambda: 0.0` (0 ⇒ bit-identical to paper).
+- `custom_resolvers.py` — `arc_tag` ⇒ `_arc0.05` folder suffix; `''` at 0 so baseline run names
+  stay byte-identical.
+- `train.py` — passes the kwarg.
+- `diagnose_straightness.py` — the gate.
+
+### 21.8 Status
+
+Implemented and unit-verified. **Gate not yet run on the pod.** No training launched.

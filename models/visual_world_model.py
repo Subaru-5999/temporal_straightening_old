@@ -37,6 +37,7 @@ class VWorldModel(nn.Module):
         straighten_scale_weights=None,
         straighten_goal_weight=0.0,
         straighten_lambdas=None,
+        straighten_speed_lambda=0.0,
         rollout_steps=1,
         rollout_gamma=0.9,
         rollout_batch_frac=1.0,
@@ -120,6 +121,16 @@ class VWorldModel(nn.Module):
 
         # weight mu of the optional directional (goal-aligned) term; 0 = disabled
         self.straighten_goal_weight = float(straighten_goal_weight)
+
+        # ---- Arc-length (constant-speed) consistency; 0.0 == paper exactly ----------------
+        # The paper's cosine curvature is SCALE-INVARIANT in each argument, so it constrains
+        # only the DIRECTION of the latent velocity and puts no pressure whatsoever on its
+        # MAGNITUDE. But the appendix proposition that justifies the cosine proxy
+        # (Assumption "Constant velocity and smooth actions") ASSUMES ||v_t||_2 = c for all t.
+        # This term supplies the missing half of that assumption. See
+        # `_scale_speed_consistency` for the derivation and why this is NOT the rejected
+        # smoothness loss.
+        self.straighten_speed_lambda = float(straighten_speed_lambda)
 
         # ---- Multi-step rollout-consistency loss (NOVEL; rollout_steps=1 == paper exactly) ----
         # The predictor is TRAINED one step ahead (teacher forcing: every input is a real encoded
@@ -431,6 +442,73 @@ class VWorldModel(nn.Module):
         v2 = va[:, s:]                 # v_{t+s}^(s)
         return self._cos_curvature(v1, v2)
 
+    def _scale_speed_consistency(self, z, s, eps=1e-6, step_thresh=1e-6):
+        """Arc-length consistency at scale s:  L_speed^(s) = mean_t [ r_t + 1/r_t - 2 ],
+        with  r_t = ||v_{t+s}^(s)|| / ||v_t^(s)||.  Zero iff consecutive latent steps have
+        EQUAL length; strictly positive otherwise.
+
+        WHY THIS TERM EXISTS (it is derived, not guessed).
+        The appendix proposition that licenses "high cosine similarity => A is close to I"
+        rests on Assumption `as:app_cos_const`, ||v_t||_2 = c for ALL t. That assumption is
+        used exactly once, to turn a norm into a cosine:
+            ||v_{t+1} - v_t||^2 = ||v_t||^2 + ||v_{t+1}||^2 - 2||v_t|| ||v_{t+1}|| C_t
+                                = 2 c^2 (1 - C_t)          <-- only if ||v_{t+1}|| = ||v_t|| = c
+        Nothing in the training loss enforces it: cosine similarity is invariant to the length
+        of each velocity, so the deployed regularizer never sees ||v_t||. Dropping the
+        assumption and redoing the same algebra with r_t = ||v_{t+1}||/||v_t|| gives the exact,
+        assumption-free identity
+            ||v_{t+1} - v_t||^2 / (||v_t|| ||v_{t+1}||)  =  (r_t + 1/r_t - 2) + 2 (1 - C_t)
+        and hence the honest version of the paper's own directional bound
+            ||(A - I) v_hat_t||  <=  sqrt( (r_t - 1)^2 + 2 r_t (1 - C_t) ) + sigma_max(B) * Da / ||v_t||
+        (set r_t = 1 to recover the paper's Eq. app_dir_point_const exactly).
+
+        CONSEQUENCE: driving the cosine term to its optimum, C_t -> 1, does NOT drive the
+        bound to zero. A residual of |r_t - 1| survives, and eps = ||A - I|| enters the
+        conditioning bound as ((1+eps)/(1-eps))^(2(H-1)), i.e. amplified exponentially in the
+        planning horizon. Speed mismatch is therefore an un-attacked floor on exactly the
+        quantity straightening is trying to shrink. This term attacks that floor, and the
+        identity above says the two terms are the two halves of ONE quantity: the
+        geometric-mean-normalised velocity difference. Their relative weight is thus FIXED by
+        the algebra (1 : 2), not by hand tuning -- with the paper's lambda_curv = 0.1, the
+        matched speed coefficient is lambda_speed = 0.05.
+
+        WHY THIS IS NOT THE SMOOTHNESS LOSS THE PAPER REJECTED (App. `app:smooth_tc`).
+        That loss is  E||z_{t+1} - z_t||^2: it penalises the MAGNITUDE of motion, so it is
+        minimised by collapsing distinct states onto each other, which is what the paper
+        observed. This term is a function of the RATIO only, so under a global rescaling
+        z -> a*z every r_t is unchanged and the loss is EXACTLY constant: its gradient has no
+        radial component, and shrinking the latent buys nothing. That property is the specific
+        lesson from the rollout-consistency failure (encoder temporal contrast collapsed ~21%,
+        planning fell 19-27 points) and from the scale-shortcut in the isometry term.
+        The r + 1/r - 2 form (rather than (r-1)^2) is used because it is symmetric under
+        r -> 1/r, so speeding up and slowing down are penalised identically; (r-1)^2 charges
+        r=2 four times as much as r=1/2 and would bias the model toward deceleration, i.e.
+        back toward the collapse direction.
+
+        COST: zero extra forward passes and NO window widening -- it reuses the very same
+        velocities the curvature term already forms, so iterations/epoch, the data window and
+        the straightening window stay bit-identical to the baseline. This is the only extension
+        so far in which the added loss term is the ONLY difference from the paper run.
+
+        Returns None if the window is too short (needs >= 2s+1 frames) or every step was
+        masked out as numerically stationary.
+        """
+        T = z.shape[1]
+        if T < 2 * s + 1:
+            return None
+        # fp32: under bf16 autocast a ratio of two O(1) norms keeps only ~3 significant
+        # digits, and this term is a small difference around r = 1.
+        va = (z[:, s:] - z[:, :-s]).float()
+        n1 = va[:, :-s].norm(dim=-1)        # ||v_t^(s)||
+        n2 = va[:, s:].norm(dim=-1)         # ||v_{t+s}^(s)||
+        mask = (n1 > step_thresh) & (n2 > step_thresh)
+        r = n2.clamp_min(eps) / n1.clamp_min(eps)
+        term = r + 1.0 / r - 2.0            # = (sqrt(r) - 1/sqrt(r))^2 >= 0, zero iff r == 1
+        term = term[mask]
+        if term.numel() == 0:
+            return None
+        return term.mean()
+
     def _scale_goal_alignment(self, z, s, z_goal):
         """Optional directional term  1 - mean_t cos(v_t^(s), z_goal - z_t): encourage each
         scale-s velocity to point toward the goal. At training time we have no true goal,
@@ -571,14 +649,22 @@ class VWorldModel(nn.Module):
         g11 = (Bd1 * Bd1).sum(-1)
         g22 = (Bd2 * Bd2).sum(-1)
         g12 = (Bd1 * Bd2).sum(-1)
-        c = (0.5 * (g11 + g22)).detach().clamp_min(1e-12)
+        # c must stay DIFFERENTIABLE. With c detached the forward value is still invariant to
+        # B -> a*B, but the gradient is NOT: writing N for the numerator, N is homogeneous of
+        # degree 4 in B, so B . grad(N/c^2) = 4N/c^2 = 4L > 0 whenever L > 0. Descent then has a
+        # strictly inward radial component and the term IS satisfiable by shrinking B -- exactly
+        # the collapse shortcut the docstring above claims it forbids. Keeping c in the graph
+        # makes L homogeneous of degree 0, so by Euler's identity B . grad(L) = 0 exactly and the
+        # radial direction carries no gradient at all. (The earlier unit test compared only
+        # forward VALUES under rescaling, which is why it passed.)
+        c = (0.5 * (g11 + g22)).clamp_min(1e-12)
         loss = (0.5 * (g11 - g22).pow(2) + 2.0 * g12.pow(2)) / c.pow(2)
         loss = loss.mean()
         logs = {
             "iso_loss_raw": loss.detach(),
             # collapse guard: mean squared response, converted back to a per-unit-perturbation
             # figure so it is comparable across runs and across iso_eps settings.
-            "iso_response_c": (c / (self.iso_eps ** 2)).mean().detach(),
+            "iso_response_c": (c.detach() / (self.iso_eps ** 2)).mean(),
         }
         return loss, logs
 
@@ -673,6 +759,7 @@ class VWorldModel(nn.Module):
         # (telescoping: v^(s) is a sum of s consecutive fine velocities) and contributes
         # almost no gradient regardless of its lambda.
         self._last_scale_curvatures = {}
+        speed_total = None      # arc-length term, summed over active scales (see below)
         for s, w in zip(self.straighten_scales, self.straighten_scale_weights):
             if w == 0:
                 continue  # lambda=0 -> scale disabled (no loss term, no window requirement)
@@ -682,6 +769,17 @@ class VWorldModel(nn.Module):
             used.append(s)
             self._last_scale_curvatures[f"curv_s{s}"] = c.detach()
             total = (w * c) if total is None else (total + w * c)
+
+            # ---- Arc-length (constant-speed) consistency at the same scale ----------------
+            # ALWAYS measured (free: same velocities, no extra forward pass) so that even
+            # paper-faithful baseline runs log the speed dispersion. Accumulated SEPARATELY and
+            # added in forward() with an ABSOLUTE lambda -- folding it into `total` here would
+            # silently multiply it by the legacy global scale (aggcos1e-1 -> 0.1).
+            sp = self._scale_speed_consistency(z, s)
+            if sp is not None:
+                self._last_scale_curvatures[f"speed_s{s}"] = sp.detach()
+                speed_total = sp if speed_total is None else (speed_total + sp)
+        self._last_speed_term = speed_total
         if total is None:
             raise ValueError(
                 f"No straightening scale fit the window (T={features.shape[1]}, "
@@ -781,6 +879,16 @@ class VWorldModel(nn.Module):
                 curvature_loss = self.total_curvature(feats, mode=self.curvature_mode)
                 loss = loss + curvature_loss * self.straighten_scale
                 loss_components["curvature_loss_used_for_training"] = curvature_loss
+                # ---- Arc-length (constant-speed) consistency; lambda=0 -> no-op (paper) ----
+                # ABSOLUTE coefficient, applied outside the legacy global scale. The derivation
+                # in _scale_speed_consistency fixes the paper-matched value at HALF the
+                # curvature lambda (0.1 -> 0.05): both terms are halves of the single quantity
+                # ||v_{t+1}-v_t||^2 / (||v_t|| ||v_{t+1}||) = (r+1/r-2) + 2(1-C).
+                _speed = getattr(self, "_last_speed_term", None)
+                if self.straighten_speed_lambda > 0 and _speed is not None:
+                    _speed_scaled = self.straighten_speed_lambda * _speed.to(loss.dtype)
+                    loss = loss + _speed_scaled
+                    loss_components["speed_loss_scaled"] = _speed_scaled.detach()
                 # Per-scale raw curvatures (logging only; detached, does not affect the loss).
                 for _k, _v in getattr(self, "_last_scale_curvatures", {}).items():
                     loss_components[_k] = _v
