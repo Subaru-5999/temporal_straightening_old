@@ -71,7 +71,25 @@ class MPCPlanner(BasePlanner):
 
     def plan(self, obs_0, obs_g, actions=None):
         """
-        actions is NOT used
+        Args:
+            actions: OPTIONAL initialization for the first sub-planner call, shape
+                (B, horizon, action_dim), normalized -- i.e. the same convention
+                `GDPlanner.init_actions` returns. None (the default, and what every normal run
+                passes) reproduces the original behavior exactly: the sub-planner initializes
+                from scratch per `sample_type`.
+
+                This used to be documented as "actions is NOT used" and was silently dropped,
+                which made `plan.py`'s `debug_dset_init` flag a NO-OP: every config in this repo
+                plans through MPCPlanner (open-loop is just `max_iter=1`), so the ground-truth
+                initialization never reached the optimizer. Verified by the symptom -- runs with
+                and without `debug_dset_init=true` returned bit-identical success arrays.
+
+                Forwarding it makes the flag work, which is what enables the decisive
+                objective-vs-optimizer diagnostic: `plan.py` sets it to `gt_actions`, the dataset
+                action sequence whose env rollout DEFINED this goal, so it reaches the goal by
+                construction. Combined with `opt_steps=0` (evaluate the initialization, no
+                optimization) and `opt_steps=100` (optimize from it), this measures whether
+                minimizing the latent objective preserves or destroys a known-good plan.
         Returns:
             actions: (B, T, action_dim) torch.Tensor
         """
@@ -81,7 +99,7 @@ class MPCPlanner(BasePlanner):
         init_obs_0, init_state_0 = self.evaluator.get_init_cond()
 
         cur_obs_0 = obs_0
-        memo_actions = None
+        memo_actions = actions
         while not np.all(self.is_success) and self.iter < self.max_iter:
             self.sub_planner.logging_prefix = f"plan_{self.iter}"
             actions, _ = self.sub_planner.plan(

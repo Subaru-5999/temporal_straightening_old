@@ -88,6 +88,11 @@ class GDPlanner(BasePlanner):
         )
 
     def get_scheduler(self, optimizer):
+        # opt_steps=0 means "evaluate the initialization, do not optimize" -- used as the control
+        # arm of the objective-vs-optimizer diagnostic. Skip the scheduler rather than construct
+        # a cosine schedule with T_max=0.
+        if self.opt_steps <= 0:
+            return None
         if self.use_cosine_scheduler:
             return torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,

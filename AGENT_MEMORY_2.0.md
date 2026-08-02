@@ -1717,3 +1717,63 @@ an objective term before it is shown to separate the two.
 2. **The ✗ (no-straightening) cell path was a guess.** `run_variant_tag` appends `_ep<N>` to
    newer runs, so the on-disk name may not match the canonical Table-1 cell name. Locate it with
    `find`, do not assume.
+
+### 22.12 `debug_dset_init` was a NO-OP in the original repo (found + fixed)
+
+**Symptom.** `plan_gd.yaml` on the matched straightened PushT baseline, seed 100, run twice —
+once default, once `debug_dset_init=true` — returned **bit-identical** results: success rate
+0.72 both times, identical 50-element success array, identical `state_dist` array.
+
+**Root cause.** `planning/mpc.py::MPCPlanner.plan` accepted `actions` and threw it away. Its own
+docstring said so: `"actions is NOT used"`, and the body opened with `memo_actions = None`.
+**Every** planner config in this repo goes through MPCPlanner — open-loop is just
+`plan_gd.yaml` with `max_iter: 1` — so `plan.py`'s
+```python
+actions_init = self.gt_actions if self.debug_dset_init else None
+self.planner.plan(..., actions=actions_init)
+```
+could never reach the optimizer. Pre-existing in the authors' code, not introduced here.
+
+**Fix.** `memo_actions = actions`. When `actions is None` (every normal run) behavior is
+unchanged; the flag now works. Shapes already line up, verified: `plan.py` builds
+`wm_actions = rearrange(actions, "b (t f) d -> b t (f d)", f=frameskip)` → `(b, 5, 10)`,
+normalized, exactly what `GDPlanner.init_actions` returns.
+
+**Why `gt_actions` is a genuine oracle here.** `plan.py` generates the goal BY rolling those very
+actions in the env (`exec_actions = denormalize(actions)` → `env.rollout` → `obs_g = rollout[:, -1]`).
+So the action sequence reaches the goal by construction, and its success rate is the ceiling.
+
+**Also fixed:** `GDPlanner.get_scheduler` returns None when `opt_steps <= 0`, so
+`opt_steps=0` ("evaluate the initialization, do not optimize") cannot hit
+`CosineAnnealingLR(T_max=0)`.
+
+**Bonus result worth keeping:** two independent processes produced byte-identical success arrays
+and state distances. **The eval pipeline is fully deterministic**, which retroactively validates
+every seed-level comparison in this memory file — differences between runs are real, not sampling
+noise in the evaluator.
+
+### 22.13 The three-arm decisive experiment (now actually runnable)
+
+All open-loop, same checkpoint, same seed, no training. `opt_steps=0` turns the planner into a
+pure evaluator of its own initialization.
+
+| arm | init | opt_steps | measures |
+|---|---|---|---|
+| A | zero | 100 | the baseline planner (**measured: 0.72 at seed 100**) |
+| B | `gt_actions` | 0 | the oracle ceiling — control that makes C interpretable |
+| C | `gt_actions` | 100 | does minimizing the latent objective PRESERVE or DESTROY a perfect plan |
+
+Reading:
+- **C ≈ B (high)** → the objective's minimum is near the task solution; A's shortfall is an
+  initialization/basin problem. Fix = multi-start selected by the model's own cost, still
+  label-free, still no training.
+- **C ≪ B, i.e. C ≈ A** → GD converges to the same place regardless of where it starts. The
+  objective, not the optimizer, is the bottleneck. With `obj_final < obj_init` recorded in
+  `logs.json`, that is direct evidence the latent cost ranks a failing plan above a working one:
+  **objective misspecification**, and no encoder-side regularizer can fix it.
+- If B itself is not near 1.0, the harness assumption is wrong and everything above is void —
+  check that first.
+
+`pathdev_init` / `pathdev_final` come along free in arm C: the path statistic of a known-good
+plan vs GD's converged plan, on the same tasks. That is the measured replacement for the
+falsified guessed corridor statistic (§22.10).
