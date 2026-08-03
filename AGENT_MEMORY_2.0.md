@@ -2200,3 +2200,99 @@ the marginally SMALLER real deviation (0.5710 vs 0.5912), the opposite of the st
 Combined with `pathdev` being flat between an exact plan and an exploited one (§23.1) and GD
 raising `pathdev` from 0.1932 toward the real-data value on its own (§23.7), **path geometry is
 conclusively not the failure mode.** Closed permanently.
+
+---
+
+## 24. **THE BINDING CONSTRAINT IS NOT OPTIMIZATION** — success is flat across a 2.7× objective range
+
+PushT, matched straightened baseline, open-loop, seed 100, 50 tasks, zero init, no training.
+
+| opt_steps | success | obj_final | n_ok | n_fail | mean(ok) | mean(fail) | AUC(obj_final) |
+|---|---|---|---|---|---|---|---|
+| 100 | 0.72 | 0.043444 | 36 | 14 | 0.016480 | 0.112780 | **0.873** |
+| 200 | 0.74 | 0.030785 | 37 | 13 | 0.014672 | 0.076643 | 0.802 |
+| 500 | 0.74 | 0.023766 | 37 | 13 | 0.013329 | 0.053472 | 0.794 |
+| 1000 | 0.72 | 0.016135 | 36 | 14 | 0.012793 | 0.024729 | 0.692 |
+
+### 24.1 The rate/conditioning hypothesis is REFUTED
+
+`mean(fail)` falls **0.1128 → 0.0247** (4.6×) as the budget goes 100 → 1000. So GD **can**
+minimize the objective on the failing tasks; it just needs more steps. That is exactly the
+"rate-limited" signature from §23.10's fork.
+
+**But success does not move: 0.72 / 0.74 / 0.74 / 0.72.** Flat within noise (1 task = 2 pp).
+10× the compute, a 2.7× lower objective, **zero additional tasks solved.**
+
+⇒ Conditioning-targeted losses are NOT justified by this data. If `κ_eff` were the binding
+constraint, buying 10× more descent would have converted failures. It converted none. **This
+closes the action-isometry route (§21.5) on evidence rather than on my earlier hand-waving.**
+
+### 24.2 The decisive comparison: matched objective, 14-point success gap
+
+| plan | obj_final | success |
+|---|---|---|
+| zero init, 1000 steps | **0.0161** | **0.72** |
+| oracle init, 100 steps (§23.1) | **0.0146** | **0.86** |
+
+Two runs at essentially the SAME objective value differ by **14 points of success**. The
+objective value does not determine the outcome — **which basin you are in does**, and the
+objective cannot see the difference. This is the cleanest single statement the whole diagnostic
+arc has produced, and it rests on two independent runs rather than on a story.
+
+### 24.3 AUC degrades as the objective approaches its floor
+
+`AUC(obj_final)`: 0.873 → 0.802 → 0.794 → **0.692**. The objective is informative while it sits
+well ABOVE the floor (at 100 steps the failures are at 0.113 versus a floor of ~0.031) and loses
+its discriminative power as everything is squeezed below the floor (at 1000 steps mean(ok) 0.0128
+and mean(fail) 0.0247 are BOTH under 0.031).
+
+So §23's noise-floor account and §23.10's "objective is informative" result are **both correct and
+not in conflict**: informativeness is a function of where you are relative to the floor. Optimizing
+past the floor destroys the only usable ranking signal we have, for no gain in success.
+
+Corollary: the paper's 100 steps is not merely at the knee of success (§22.17) — it is also the
+point of **maximum per-task informativeness** (AUC 0.873, the highest of the four budgets). The
+authors' choice is better than it looked, twice over.
+
+### 24.4 The hard core is stable
+
+`n_fail` = 14 / 13 / 13 / 14 across the four budgets. The same ~13-14 tasks fail throughout; the
+set does not churn. These tasks need a **different basin**, not a lower objective.
+
+`obj_init` AUC stays weak throughout (0.599 / 0.653 / 0.669 / 0.621), so initial difficulty is
+only weakly predictive — the failures are not simply the distant tasks.
+
+`pathdev_final` 0.3685 / 0.3667 / 0.3589 / 0.3624 — flat, near the real-data 0.398. Path geometry
+irrelevant for the fifth time.
+
+### 24.5 What is now closed, and what survives
+
+**Closed on measurement** (do not revisit without new evidence):
+- Latent geodesic corridor / any chord-based prior (§22.10, §23.4, §23.11, and again here).
+- Over-optimization / early stopping (§22.17): more steps is harmless, not harmful.
+- Noise-floor stopping rule (§23.7): never fires in the deployed regime.
+- **Conditioning / action-isometry (NEW, this section): 10× descent converts nothing.**
+- Five representation-side regularizers (§22.1).
+
+**Survives:** the failures need a different **basin**. The only lever that changes basins without
+privileged information is **diversified initialization plus a selection rule**. `sample_type=randn`
+already exists in `GDPlanner.init_actions`.
+
+### 24.6 The inferential gap that must be closed before building multi-start
+
+`AUC(obj_final) = 0.873` establishes that, **across tasks at a fixed protocol**, a task's objective
+predicts its outcome. Multi-start needs a **different** conditional: that **across candidate plans
+for a FIXED task**, the lower-objective candidate is the more successful one. Those are not the
+same claim, and §23.1 is a live warning that they can diverge — there, reducing a single task's
+objective from 0.0319 to 0.0146 made it *fail*.
+
+**Cheap, no-training gate:** run the same open-loop config with `sample_type=randn` at several
+planner seeds, collect per-task `(obj_final, success)` for every restart, and measure the
+within-task AUC — does argmin-over-restarts by objective pick the successful restart? If yes,
+multi-start with label-free selection is justified and the expected gain is bounded by the 9
+recoverable tasks (18 pp) identified in §22.14. If no, selection by the model's own cost cannot
+work and the planner route closes too.
+
+Note the encouraging aggregate hint (NOT proof, and confounded by the oracle being privileged):
+at matched objective the oracle-init candidate had both the lower objective (0.0146 < 0.0161) AND
+the higher success (0.86 > 0.72), i.e. argmin-J would have picked correctly there.
